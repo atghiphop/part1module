@@ -38,7 +38,7 @@ const PRICING_STATUS_LABELS = PRICING_STATUS_OPTIONS.reduce((labels, option) => 
 const IMPORT_NOTE_MIN_LENGTH = 20;
 const ACTIONS_COLUMN_WIDTH = 140;
 const MIN_TABLE_COLUMN_WIDTH = 110;
-const ESTIMATOR_BOOKS_STORAGE_KEY = "part1module:estimator-books:v1";
+export const ESTIMATOR_BOOKS_STORAGE_KEY = "part1module:estimator-books:v1";
 const ESTIMATOR_ACTIVE_BOOK_STORAGE_KEY = "part1module:estimator-active-book:v1";
 const ESTIMATOR_COLUMNS_STORAGE_KEY = "part1module:estimator-columns:v1";
 const ESTIMATOR_IMPORT_TEMPLATES_STORAGE_KEY = "part1module:estimator-import-templates:v1";
@@ -84,7 +84,7 @@ const writeJsonStorage = (key, value) => {
   }
 };
 
-const normalizeStoredBooks = (storedBooks) =>
+export const normalizeStoredBooks = (storedBooks) =>
   Array.isArray(storedBooks) ? storedBooks.map(normalizeStoredBook) : [];
 
 const normalizeStoredImportTemplates = (storedTemplates) => {
@@ -393,8 +393,11 @@ const formatOptionalCurrency = (value) => {
   return parsedValue === null ? "--" : formatCurrency(parsedValue);
 };
 
-const getBookItemCount = (book) =>
-  book.groups.reduce((total, group) => total + group.items.length, 0);
+export const getBookItemCount = (book) =>
+  (Array.isArray(book?.groups) ? book.groups : []).reduce(
+    (total, group) => total + (Array.isArray(group?.items) ? group.items.length : 0),
+    0,
+  );
 
 const getActiveOtherEntries = (item, type) =>
   item.others.filter((other) => other.type === type && other.isActive !== false);
@@ -424,6 +427,273 @@ const getOtherSummary = (item, type) => {
       return `${entry.name || "Info"}: ${entry.value}`;
     })
     .join(" · ");
+};
+
+const parsePercentLikeValue = (value) => {
+  const parsedValue = parseFloat(value);
+  return Number.isNaN(parsedValue) ? null : parsedValue;
+};
+
+const roundCurrencyValue = (value) => roundToTwo(value || 0);
+
+const formatContractCurrencyValue = (value) => roundCurrencyValue(value).toFixed(2);
+
+const getPositiveContractPricingTargets = (item) => {
+  const targets = [];
+  const baseTargets = [
+    { id: "material", value: parseFloat(item.material) || 0 },
+    { id: "labor", value: parseFloat(item.labor) || 0 },
+    { id: "equipment", value: parseFloat(item.equipment) || 0 },
+  ];
+
+  baseTargets.forEach((target) => {
+    if (target.value > 0.0001) {
+      targets.push(target.id);
+    }
+  });
+
+  getActiveOtherEntries(item, "amount").forEach((amount) => {
+    const value = parseFloat(amount.value) || 0;
+    if (value > 0.0001) {
+      targets.push(amount.id);
+    }
+  });
+
+  return targets;
+};
+
+const getUniformContractDiscountPercent = (item) => {
+  const activeDiscounts = getActiveOtherEntries(item, "discount");
+  if (activeDiscounts.length === 0) {
+    return null;
+  }
+
+  const uniquePercents = new Set();
+  activeDiscounts.forEach((discount) => {
+    const percent = parsePercentLikeValue(discount.percent);
+    if (percent !== null && Math.abs(percent) > 0.0001) {
+      uniquePercents.add(percent.toFixed(6));
+    }
+  });
+
+  if (uniquePercents.size !== 1) {
+    return null;
+  }
+
+  const positiveTargets = getPositiveContractPricingTargets(item);
+  if (positiveTargets.length === 0) {
+    return null;
+  }
+
+  const coveredTargets = new Set();
+  activeDiscounts.forEach((discount) => {
+    discount.targets.forEach((targetId) => {
+      coveredTargets.add(targetId);
+    });
+  });
+
+  const coversAllPositiveTargets = positiveTargets.every((targetId) => coveredTargets.has(targetId));
+  if (!coversAllPositiveTargets) {
+    return null;
+  }
+
+  return parseFloat([...uniquePercents][0]);
+};
+
+const getEstimatorItemPricingMetrics = (item) => {
+  const totals = calculateItemTotals(item);
+  const preDiscountTotal = totals.baseTotal + totals.otherAmountsTotal;
+  const finalTotal = totals.calculatedTotal;
+  const hasEstimatorDiscount =
+    getActiveOtherEntries(item, "discount").length > 0 && totals.discountsTotal > 0.01;
+  const uniformContractDiscountPercent = getUniformContractDiscountPercent(item);
+  const canRepresentAsContractDiscount =
+    hasEstimatorDiscount &&
+    uniformContractDiscountPercent !== null &&
+    preDiscountTotal > 0.01 &&
+    finalTotal >= 0;
+  const effectiveDiscountPercent = canRepresentAsContractDiscount
+    ? ((preDiscountTotal - finalTotal) / preDiscountTotal) * 100
+    : 0;
+
+  return {
+    ...totals,
+    preDiscountTotal,
+    finalTotal,
+    hasEstimatorDiscount,
+    canRepresentAsContractDiscount,
+    effectiveDiscountPercent,
+    uniformContractDiscountPercent,
+  };
+};
+
+const estimatorItemHasContractData = (group, item) => {
+  const textFields = [
+    getGroupItemNumber(group, item.itemNumber),
+    item.itemName,
+    item.description,
+    item.uom,
+  ];
+
+  if (textFields.some((value) => normalizeTextValue(value).trim())) {
+    return true;
+  }
+
+  if (Math.abs(getItemFinalTotal(item)) > 0.01) {
+    return true;
+  }
+
+  if ((item.others || []).some((other) => other.isActive !== false)) {
+    return true;
+  }
+
+  return item.pricingStatus !== "priced";
+};
+
+const toContractPercentValue = (value) => {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+
+  return Number.parseFloat(value.toFixed(2));
+};
+
+const getIncludedEstimatorGroupsForPart1Import = (book, groupIds) => {
+  if (!Array.isArray(groupIds)) {
+    return book.groups;
+  }
+
+  const selectedGroupIds = new Set(groupIds);
+  return book.groups.filter((group) => selectedGroupIds.has(group.id));
+};
+
+export const summarizeEstimatorBookForPart1Import = (storedBook, options = {}) => {
+  const book = normalizeStoredBook(storedBook);
+  const includedGroups = getIncludedEstimatorGroupsForPart1Import(book, options?.groupIds);
+  const summary = {
+    itemCount: 0,
+    discountedItemCount: 0,
+    convertibleDiscountItemCount: 0,
+    fallbackDiscountItemCount: 0,
+  };
+
+  includedGroups.forEach((group) => {
+    group.items.forEach((item) => {
+      if (!estimatorItemHasContractData(group, item)) {
+        return;
+      }
+
+      summary.itemCount += 1;
+
+      const pricingMetrics = getEstimatorItemPricingMetrics(item);
+      if (!pricingMetrics.hasEstimatorDiscount) {
+        return;
+      }
+
+      summary.discountedItemCount += 1;
+
+      if (pricingMetrics.canRepresentAsContractDiscount) {
+        summary.convertibleDiscountItemCount += 1;
+      } else {
+        summary.fallbackDiscountItemCount += 1;
+      }
+    });
+  });
+
+  return summary;
+};
+
+export const buildPart1RowsFromEstimatorBook = (storedBook, vendorName = "", options = {}) => {
+  const book = normalizeStoredBook(storedBook);
+  const manufacturer = normalizeTextValue(vendorName).trim();
+  const pricingMode =
+    options?.pricingMode === "contract_discount" ? "contract_discount" : "final_price";
+  const includedGroups = getIncludedEstimatorGroupsForPart1Import(book, options?.groupIds);
+  const rows = [];
+
+  includedGroups.forEach((group) => {
+    group.items.forEach((item) => {
+      if (!estimatorItemHasContractData(group, item)) {
+        return;
+      }
+
+      const productNumber = getGroupItemNumber(group, item.itemNumber);
+      const groupName = normalizeTextValue(group.name).trim();
+      const pricingStatusLabel = PRICING_STATUS_LABELS[item.pricingStatus] || "Priced";
+      const amountSummary = getOtherSummary(item, "amount");
+      const discountSummary = getOtherSummary(item, "discount");
+      const infoSummary = getOtherSummary(item, "info");
+      const pricingMetrics = getEstimatorItemPricingMetrics(item);
+      const shouldImportEstimatorDiscount =
+        pricingMode === "contract_discount" &&
+        item.pricingStatus === "priced" &&
+        pricingMetrics.canRepresentAsContractDiscount;
+      const descriptionParts = [];
+      let msrpValue =
+        item.pricingStatus === "priced"
+          ? roundToTwo(pricingMetrics.finalTotal).toFixed(2)
+          : pricingStatusLabel;
+      let discountValue = 0;
+
+      if (normalizeTextValue(item.description).trim()) {
+        descriptionParts.push(normalizeTextValue(item.description).trim());
+      }
+
+      if (groupName) {
+        descriptionParts.push(`Estimator group: ${groupName}`);
+      }
+
+      if (item.pricingStatus !== "priced") {
+        descriptionParts.push(`Pricing status: ${pricingStatusLabel}`);
+      }
+
+      if (shouldImportEstimatorDiscount) {
+        const resolvedContractDiscountPercent =
+          pricingMetrics.uniformContractDiscountPercent ?? pricingMetrics.effectiveDiscountPercent;
+        discountValue = toContractPercentValue(resolvedContractDiscountPercent);
+        msrpValue = formatContractCurrencyValue(pricingMetrics.preDiscountTotal);
+        descriptionParts.push("Estimator pricing imported as MSRP plus contract discount.");
+      } else if (pricingMetrics.hasEstimatorDiscount) {
+        descriptionParts.push("Estimator final total already includes discounts.");
+
+        if (
+          pricingMode === "contract_discount" &&
+          !pricingMetrics.canRepresentAsContractDiscount &&
+          item.pricingStatus === "priced"
+        ) {
+          descriptionParts.push(
+            "Estimator discounts could not be converted into a single contract discount, so the final price was imported with 0% contract discount.",
+          );
+        }
+      }
+
+      if (amountSummary !== "--") {
+        descriptionParts.push(`Additional amounts: ${amountSummary}`);
+      }
+
+      if (discountSummary !== "--") {
+        descriptionParts.push(`Estimator discounts: ${discountSummary}`);
+      }
+
+      if (infoSummary !== "--") {
+        descriptionParts.push(`Notes: ${infoSummary}`);
+      }
+
+      rows.push({
+        id: generateId(),
+        manufacturer: manufacturer || "",
+        website: "",
+        productName: normalizeTextValue(item.itemName).trim() || groupName || "Estimator Item",
+        productNumber,
+        description: descriptionParts.join(" | "),
+        units: normalizeTextValue(item.uom).trim(),
+        msrp: msrpValue,
+        discount: discountValue,
+      });
+    });
+  });
+
+  return rows;
 };
 
 const itemMatchesSearch = (group, item, query) => {

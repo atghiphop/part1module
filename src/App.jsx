@@ -18,7 +18,13 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import EstimatorPage from "./EstimatorPage";
+import EstimatorPage, {
+  ESTIMATOR_BOOKS_STORAGE_KEY,
+  buildPart1RowsFromEstimatorBook,
+  getBookItemCount,
+  normalizeStoredBooks,
+  summarizeEstimatorBookForPart1Import,
+} from "./EstimatorPage";
 
 const STORAGE_KEY = "part1module:saved-modules:v1";
 const VIEW_MODE_KEY = "part1module:view-mode:v1";
@@ -192,6 +198,14 @@ export default function App() {
   const [usingThirdParty, setUsingThirdParty] = useState(null);
   const [catalogs, setCatalogs] = useState([createEmptyCatalog()]);
   const [directImport, setDirectImport] = useState(createEmptyDirectImport());
+  const [estimatorBooks, setEstimatorBooks] = useState(() =>
+    normalizeStoredBooks(readJsonStorage(ESTIMATOR_BOOKS_STORAGE_KEY, [])),
+  );
+  const [useExistingBook, setUseExistingBook] = useState(null);
+  const [selectedEstimatorBookId, setSelectedEstimatorBookId] = useState(null);
+  const [selectedEstimatorBookSnapshot, setSelectedEstimatorBookSnapshot] = useState(null);
+  const [selectedEstimatorGroupIds, setSelectedEstimatorGroupIds] = useState([]);
+  const [estimatorPricingMode, setEstimatorPricingMode] = useState(null);
   const [tableData, setTableData] = useState([]);
   const [annotations, setAnnotations] = useState({ global: "", rows: {} });
 
@@ -219,6 +233,134 @@ export default function App() {
     };
   }, []);
 
+  const refreshEstimatorBooks = () => {
+    setEstimatorBooks(normalizeStoredBooks(readJsonStorage(ESTIMATOR_BOOKS_STORAGE_KEY, [])));
+  };
+
+  useEffect(() => {
+    if (page !== "estimator") {
+      refreshEstimatorBooks();
+    }
+  }, [page]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    const handleEstimatorBooksRefresh = () => {
+      refreshEstimatorBooks();
+    };
+
+    window.addEventListener("focus", handleEstimatorBooksRefresh);
+    window.addEventListener("storage", handleEstimatorBooksRefresh);
+
+    return () => {
+      window.removeEventListener("focus", handleEstimatorBooksRefresh);
+      window.removeEventListener("storage", handleEstimatorBooksRefresh);
+    };
+  }, []);
+
+  const getSelectedEstimatorBook = () =>
+    estimatorBooks.find((book) => book.id === selectedEstimatorBookId) ?? selectedEstimatorBookSnapshot;
+
+  const getEstimatorBookGroupIds = (book) =>
+    Array.isArray(book?.groups) ? book.groups.map((group) => group.id) : [];
+
+  const getEstimatorBookItemCountForGroups = (book, groupIds) => {
+    if (!Array.isArray(book?.groups)) {
+      return 0;
+    }
+
+    const selectedGroupIds = Array.isArray(groupIds) ? new Set(groupIds) : null;
+
+    return book.groups.reduce((total, group) => {
+      if (selectedGroupIds && !selectedGroupIds.has(group.id)) {
+        return total;
+      }
+
+      return total + (Array.isArray(group.items) ? group.items.length : 0);
+    }, 0);
+  };
+
+  const applyEstimatorGroupSelection = (book, groupIds = null) => {
+    const availableGroupIds = getEstimatorBookGroupIds(book);
+
+    if (!Array.isArray(groupIds)) {
+      setSelectedEstimatorGroupIds(availableGroupIds);
+      return;
+    }
+
+    setSelectedEstimatorGroupIds(availableGroupIds.filter((groupId) => groupIds.includes(groupId)));
+  };
+
+  const handleUseExistingBookChange = (value) => {
+    setUseExistingBook(value);
+
+    if (!value) {
+      setSelectedEstimatorBookId(null);
+      setSelectedEstimatorBookSnapshot(null);
+      setSelectedEstimatorGroupIds([]);
+      setEstimatorPricingMode(null);
+      return;
+    }
+
+    const nextBook =
+      estimatorBooks.find((book) => book.id === selectedEstimatorBookId) ?? estimatorBooks[0] ?? null;
+
+    if (nextBook) {
+      setSelectedEstimatorBookId(nextBook.id);
+      setSelectedEstimatorBookSnapshot(cloneData(nextBook));
+      applyEstimatorGroupSelection(nextBook);
+      setEstimatorPricingMode(null);
+      return;
+    }
+
+    if (selectedEstimatorBookSnapshot?.id) {
+      setSelectedEstimatorBookId(selectedEstimatorBookSnapshot.id);
+      applyEstimatorGroupSelection(selectedEstimatorBookSnapshot);
+    }
+  };
+
+  const handleEstimatorBookSelect = (bookId) => {
+    setSelectedEstimatorBookId(bookId);
+    setEstimatorPricingMode(null);
+
+    const selectedBook =
+      estimatorBooks.find((book) => book.id === bookId) ??
+      (selectedEstimatorBookSnapshot?.id === bookId ? selectedEstimatorBookSnapshot : null);
+
+    if (selectedBook) {
+      if (estimatorBooks.some((book) => book.id === bookId)) {
+        setSelectedEstimatorBookSnapshot(cloneData(selectedBook));
+      }
+      applyEstimatorGroupSelection(selectedBook);
+    }
+  };
+
+  const handleToggleEstimatorGroup = (groupId) => {
+    const selectedBook = getSelectedEstimatorBook();
+    const orderedGroupIds = getEstimatorBookGroupIds(selectedBook);
+
+    setSelectedEstimatorGroupIds((currentGroupIds) => {
+      const nextSelection = new Set(currentGroupIds);
+
+      if (nextSelection.has(groupId)) {
+        nextSelection.delete(groupId);
+      } else {
+        nextSelection.add(groupId);
+      }
+
+      return orderedGroupIds.filter((currentGroupId) => nextSelection.has(currentGroupId));
+    });
+  };
+
+  const handleSelectAllEstimatorGroups = () => {
+    applyEstimatorGroupSelection(getSelectedEstimatorBook());
+  };
+
+  const handleClearEstimatorGroups = () => {
+    setSelectedEstimatorGroupIds([]);
+  };
+
   const navigateToPage = (nextPage, options = {}) => {
     const { replace = false } = options;
 
@@ -245,6 +387,7 @@ export default function App() {
   };
 
   const resetWizard = () => {
+    refreshEstimatorBooks();
     setEditingId(null);
     setConfirmingSubmit(false);
     setVendorName("");
@@ -253,6 +396,11 @@ export default function App() {
     setUsingThirdParty(null);
     setCatalogs([createEmptyCatalog()]);
     setDirectImport(createEmptyDirectImport());
+    setUseExistingBook(null);
+    setSelectedEstimatorBookId(null);
+    setSelectedEstimatorBookSnapshot(null);
+    setSelectedEstimatorGroupIds([]);
+    setEstimatorPricingMode(null);
     setTableData([]);
     setAnnotations({ global: "", rows: {} });
     setStep(0);
@@ -261,6 +409,10 @@ export default function App() {
   const saveModule = (newStatus = null) => {
     const existingModule = editingId ? savedModules.find((module) => module.id === editingId) : null;
     const status = newStatus || existingModule?.status || "Draft";
+    const currentSelectedEstimatorBook = useExistingBook ? getSelectedEstimatorBook() : null;
+    const resolvedEstimatorBookSnapshot = currentSelectedEstimatorBook
+      ? cloneData(currentSelectedEstimatorBook)
+      : null;
 
     const moduleData = {
       id: editingId || genId(),
@@ -273,6 +425,11 @@ export default function App() {
       usingThirdParty,
       catalogs,
       directImport,
+      useExistingBook,
+      selectedEstimatorBookId,
+      selectedEstimatorBookSnapshot: resolvedEstimatorBookSnapshot,
+      selectedEstimatorGroupIds,
+      estimatorPricingMode,
       status,
       annotations,
     };
@@ -289,6 +446,7 @@ export default function App() {
   };
 
   const loadModule = (module, action = "edit") => {
+    refreshEstimatorBooks();
     setEditingId(module.id);
     setContractName(module.name);
     setVendorName(module.vendor);
@@ -298,6 +456,18 @@ export default function App() {
     if (module.usingThirdParty !== undefined) setUsingThirdParty(module.usingThirdParty);
     if (module.catalogs) setCatalogs(cloneData(module.catalogs));
     if (module.directImport) setDirectImport(cloneData(module.directImport));
+    setUseExistingBook(module.useExistingBook ?? null);
+    setSelectedEstimatorBookId(module.selectedEstimatorBookId ?? null);
+    setSelectedEstimatorBookSnapshot(
+      module.selectedEstimatorBookSnapshot ? cloneData(module.selectedEstimatorBookSnapshot) : null,
+    );
+    applyEstimatorGroupSelection(
+      module.selectedEstimatorBookSnapshot ??
+        estimatorBooks.find((book) => book.id === module.selectedEstimatorBookId) ??
+        null,
+      Array.isArray(module.selectedEstimatorGroupIds) ? module.selectedEstimatorGroupIds : null,
+    );
+    setEstimatorPricingMode(module.estimatorPricingMode ?? null);
 
     setAnnotations(cloneData(module.annotations || { global: "", rows: {} }));
     setConfirmingSubmit(action === "confirm");
@@ -417,6 +587,16 @@ export default function App() {
 
   const generateTable = () => {
     const newTable = [];
+    const selectedEstimatorBook = useExistingBook ? getSelectedEstimatorBook() : null;
+
+    if (selectedEstimatorBook) {
+      newTable.push(
+        ...buildPart1RowsFromEstimatorBook(selectedEstimatorBook, vendorName, {
+          groupIds: selectedEstimatorGroupIds,
+          pricingMode: estimatorPricingMode,
+        }),
+      );
+    }
 
     if (usingThirdParty) {
       catalogs.forEach((catalog) => {
@@ -773,6 +953,29 @@ export default function App() {
   );
 
   const Step2View = () => {
+    const showExistingBookQuestion =
+      estimatorBooks.length > 0 || useExistingBook === true || Boolean(selectedEstimatorBookSnapshot);
+    const selectedEstimatorBook = useExistingBook ? getSelectedEstimatorBook() : null;
+    const selectedEstimatorBookSummary = selectedEstimatorBook
+      ? summarizeEstimatorBookForPart1Import(selectedEstimatorBook, {
+          groupIds: selectedEstimatorGroupIds,
+        })
+      : null;
+    const selectedBookExistsInEstimator = estimatorBooks.some(
+      (book) => book.id === selectedEstimatorBookId,
+    );
+    const selectedEstimatorGroupCount = selectedEstimatorGroupIds.length;
+    const totalEstimatorGroupCount = selectedEstimatorBook?.groups?.length ?? 0;
+    const selectedEstimatorItemCount = selectedEstimatorBook
+      ? getEstimatorBookItemCountForGroups(selectedEstimatorBook, selectedEstimatorGroupIds)
+      : 0;
+    const hasEstimatorGroupsToChoose = totalEstimatorGroupCount > 0;
+    const hasSelectedEstimatorGroups = !hasEstimatorGroupsToChoose || selectedEstimatorGroupCount > 0;
+    const requiresEstimatorPricingQuestion =
+      (selectedEstimatorBookSummary?.discountedItemCount ?? 0) > 0;
+    const catalogQuestionNumber = showExistingBookQuestion ? 5 : 4;
+    const directImportQuestionNumber = showExistingBookQuestion ? 6 : 5;
+
     const MapColumnsUI = ({ mapping, onMapChange }) => (
       <div className="bg-white border border-[#0e3f4e]/20 rounded-xl p-5 shadow-sm mt-4">
         <h4 className="font-semibold text-[#0e3f4e] mb-4 flex items-center">
@@ -810,7 +1013,12 @@ export default function App() {
       </div>
     );
 
-    const canProceed = usingThirdParty !== null && directImport.hasLineItems !== null;
+    const canProceed =
+      usingThirdParty !== null &&
+      directImport.hasLineItems !== null &&
+      (!showExistingBookQuestion || useExistingBook !== null) &&
+      (!useExistingBook || (Boolean(selectedEstimatorBook) && hasSelectedEstimatorGroups)) &&
+      (!requiresEstimatorPricingQuestion || Boolean(estimatorPricingMode));
 
     return (
       <div className="max-w-5xl mx-auto animate-in slide-in-from-right-8 fade-in duration-300">
@@ -820,9 +1028,225 @@ export default function App() {
             <h2 className="text-2xl font-bold text-gray-900">Catalog & Import Details</h2>
           </div>
 
+          {showExistingBookQuestion && (
+            <div className="mb-8 border-b border-gray-100 pb-8">
+              <label className="block text-base font-semibold text-gray-800 mb-3">
+                4. Would you like to use an existing book?
+              </label>
+              <YesNoToggle value={useExistingBook} onChange={handleUseExistingBookChange} />
+
+              {useExistingBook === true && (
+                <div className="mt-6 rounded-xl border border-[#0e3f4e]/20 bg-[#0e3f4e]/5 p-5 animate-in fade-in slide-in-from-top-4 duration-300">
+                  <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                    <div>
+                      <p className="text-sm text-gray-700">
+                        Select a saved estimator book and its items will be added to the Part 1
+                        table when you finish this step.
+                      </p>
+                      {selectedEstimatorBook && (
+                        <p className="mt-2 text-xs font-medium uppercase tracking-wider text-[#0e3f4e]">
+                          {hasEstimatorGroupsToChoose ? selectedEstimatorGroupCount : totalEstimatorGroupCount} of{" "}
+                          {totalEstimatorGroupCount} groups selected ·{" "}
+                          {hasEstimatorGroupsToChoose
+                            ? selectedEstimatorItemCount
+                            : getBookItemCount(selectedEstimatorBook)}{" "}
+                          items
+                        </p>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => navigateToPage("estimator")}
+                      className="inline-flex items-center rounded-lg border border-[#0e3f4e]/20 bg-white px-4 py-2 text-sm font-semibold text-[#0e3f4e] shadow-sm transition-colors hover:bg-[#0e3f4e]/5"
+                    >
+                      <BookOpen size={16} className="mr-2" /> Open Estimator
+                    </button>
+                  </div>
+
+                  {estimatorBooks.length > 0 ? (
+                    <>
+                      <label className="mt-5 block text-sm font-semibold text-gray-700 mb-2">
+                        Choose a saved book
+                      </label>
+                      <select
+                        value={selectedEstimatorBookId || ""}
+                        onChange={(event) => handleEstimatorBookSelect(event.target.value)}
+                        className="w-full rounded-lg border border-gray-300 bg-white px-4 py-2.5 text-sm focus:border-[#0e3f4e] focus:outline-none focus:ring-2 focus:ring-[#0e3f4e]"
+                      >
+                        {!selectedEstimatorBookId && <option value="">Select a book</option>}
+                        {useExistingBook &&
+                          selectedEstimatorBookId &&
+                          !selectedBookExistsInEstimator &&
+                          selectedEstimatorBookSnapshot && (
+                            <option value={selectedEstimatorBookId}>
+                              {selectedEstimatorBookSnapshot.name} (saved snapshot)
+                            </option>
+                          )}
+                        {estimatorBooks.map((book) => (
+                          <option key={book.id} value={book.id}>
+                            {book.name} ({book.groups.length} groups, {getBookItemCount(book)} items)
+                          </option>
+                        ))}
+                      </select>
+                    </>
+                  ) : selectedEstimatorBookSnapshot ? (
+                    <div className="mt-5 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+                      This contract will use the saved snapshot of{" "}
+                      <strong>{selectedEstimatorBookSnapshot.name}</strong> because that book is no
+                      longer available in the estimator.
+                    </div>
+                  ) : (
+                    <div className="mt-5 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+                      No saved estimator books are available yet. Create one in the estimator or
+                      switch this answer to No.
+                    </div>
+                  )}
+
+                  {selectedEstimatorBook &&
+                    estimatorBooks.length > 0 &&
+                    !selectedBookExistsInEstimator &&
+                    selectedEstimatorBookSnapshot && (
+                      <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+                        The originally selected book is missing from the estimator, so the saved
+                        snapshot will be used unless you choose a different book above.
+                      </div>
+                    )}
+
+                  {selectedEstimatorBook && hasEstimatorGroupsToChoose && (
+                    <div className="mt-5 rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                        <div>
+                          <label className="block text-sm font-semibold text-gray-800">
+                            Choose which groups to import
+                          </label>
+                          <p className="mt-1 text-sm text-gray-600">
+                            All groups are selected by default. Uncheck any groups you do not want
+                            in this contract.
+                          </p>
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={handleSelectAllEstimatorGroups}
+                            className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 transition-colors hover:border-[#0e3f4e] hover:text-[#0e3f4e]"
+                          >
+                            Select All
+                          </button>
+                          <button
+                            onClick={handleClearEstimatorGroups}
+                            className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 transition-colors hover:border-[#0e3f4e] hover:text-[#0e3f4e]"
+                          >
+                            Clear All
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="mt-4 grid gap-3 md:grid-cols-2">
+                        {selectedEstimatorBook.groups.map((group) => {
+                          const isSelected = selectedEstimatorGroupIds.includes(group.id);
+                          const itemCount = Array.isArray(group.items) ? group.items.length : 0;
+
+                          return (
+                            <label
+                              key={group.id}
+                              className={`flex cursor-pointer items-start gap-3 rounded-xl border p-4 transition-all ${
+                                isSelected
+                                  ? "border-[#0e3f4e] bg-[#0e3f4e]/10 shadow-sm"
+                                  : "border-gray-200 bg-white hover:border-[#0e3f4e]/30 hover:bg-[#0e3f4e]/5"
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                onChange={() => handleToggleEstimatorGroup(group.id)}
+                                className="mt-1 h-4 w-4 rounded border-gray-300 text-[#0e3f4e] focus:ring-[#0e3f4e]"
+                              />
+                              <div className="min-w-0">
+                                <div className="font-semibold text-gray-900">{group.name}</div>
+                                <div className="text-sm text-gray-600">
+                                  {itemCount} item{itemCount === 1 ? "" : "s"}
+                                </div>
+                              </div>
+                            </label>
+                          );
+                        })}
+                      </div>
+
+                      {!hasSelectedEstimatorGroups && (
+                        <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                          Select at least one estimator group to import.
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {selectedEstimatorBook && !hasEstimatorGroupsToChoose && (
+                    <div className="mt-5 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+                      This saved book does not have any groups yet, so there is nothing to import
+                      from it right now.
+                    </div>
+                  )}
+
+                  {selectedEstimatorBook && requiresEstimatorPricingQuestion && (
+                    <div className="mt-5 rounded-lg border border-amber-200 bg-white p-4 shadow-sm">
+                      <label className="block text-sm font-semibold text-gray-800 mb-2">
+                        This book already includes estimator discounts on{" "}
+                        {selectedEstimatorBookSummary.discountedItemCount} item
+                        {selectedEstimatorBookSummary.discountedItemCount === 1 ? "" : "s"}. How
+                        should those items be imported?
+                      </label>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <button
+                          onClick={() => setEstimatorPricingMode("contract_discount")}
+                          className={`rounded-xl border p-4 text-left transition-all ${
+                            estimatorPricingMode === "contract_discount"
+                              ? "border-[#0e3f4e] bg-[#0e3f4e]/10 ring-1 ring-[#0e3f4e]"
+                              : "border-gray-200 bg-white hover:border-[#0e3f4e]/40 hover:bg-[#0e3f4e]/5"
+                          }`}
+                        >
+                          <div className="text-sm font-semibold text-gray-900">
+                            Import MSRP + Discount
+                          </div>
+                          <p className="mt-1 text-sm text-gray-600">
+                            Use the estimator pre-discount amount as MSRP and carry the effective
+                            estimator discount into the contract&apos;s % Discount field.
+                          </p>
+                        </button>
+                        <button
+                          onClick={() => setEstimatorPricingMode("final_price")}
+                          className={`rounded-xl border p-4 text-left transition-all ${
+                            estimatorPricingMode === "final_price"
+                              ? "border-[#0e3f4e] bg-[#0e3f4e]/10 ring-1 ring-[#0e3f4e]"
+                              : "border-gray-200 bg-white hover:border-[#0e3f4e]/40 hover:bg-[#0e3f4e]/5"
+                          }`}
+                        >
+                          <div className="text-sm font-semibold text-gray-900">
+                            Import Final Price Only
+                          </div>
+                          <p className="mt-1 text-sm text-gray-600">
+                            Import the estimator&apos;s already-discounted final total as
+                            MSRP/Pricing and leave the contract discount at 0%.
+                          </p>
+                        </button>
+                      </div>
+
+                      {selectedEstimatorBookSummary.fallbackDiscountItemCount > 0 && (
+                        <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                          {selectedEstimatorBookSummary.fallbackDiscountItemCount} discounted item
+                          {selectedEstimatorBookSummary.fallbackDiscountItemCount === 1 ? "" : "s"}{" "}
+                          cannot be converted into one clean contract discount. If you choose
+                          Import MSRP + Discount, those rows will fall back to final price with 0%
+                          discount.
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
           <div>
             <label className="block text-base font-semibold text-gray-800 mb-3">
-              4. Are you using any 3rd party catalogs?
+              {catalogQuestionNumber}. Are you using any 3rd party catalogs?
             </label>
             <YesNoToggle value={usingThirdParty} onChange={setUsingThirdParty} />
           </div>
@@ -971,7 +1395,7 @@ export default function App() {
         {usingThirdParty !== null && (
           <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-8 animate-in slide-in-from-top-4 duration-300">
             <label className="block text-base font-semibold text-gray-800 mb-3">
-              5. Do you have any {usingThirdParty ? "additional " : ""}
+              {directImportQuestionNumber}. Do you have any {usingThirdParty ? "additional " : ""}
               line items to import directly (not from a 3rd party catalog)?
             </label>
             <YesNoToggle
@@ -979,12 +1403,22 @@ export default function App() {
               onChange={(value) => setDirectImport((prev) => ({ ...prev, hasLineItems: value }))}
             />
 
-            {directImport.hasLineItems === false && !usingThirdParty && (
+            {directImport.hasLineItems === false && !usingThirdParty && !selectedEstimatorBook && (
               <div className="mt-6 p-4 bg-amber-50 rounded-lg border border-amber-200 flex items-start text-sm text-amber-800 animate-in fade-in">
                 <Info className="mr-2 shrink-0 mt-0.5" size={16} />
                 <p>
                   If you have no catalogs and no line items to import, your Part 1 Contract will be
                   created with a blank table for you to manually add rows.
+                </p>
+              </div>
+            )}
+
+            {directImport.hasLineItems === false && !usingThirdParty && selectedEstimatorBook && (
+              <div className="mt-6 p-4 bg-emerald-50 rounded-lg border border-emerald-200 flex items-start text-sm text-emerald-800 animate-in fade-in">
+                <CheckCircle2 className="mr-2 shrink-0 mt-0.5" size={16} />
+                <p>
+                  Your selected estimator book will populate the Part 1 table even without
+                  additional direct imports or 3rd party catalogs.
                 </p>
               </div>
             )}
