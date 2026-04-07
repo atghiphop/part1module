@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import {
+  BookOpen,
   Building2,
   Check,
   CheckCircle2,
@@ -17,11 +18,18 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import EstimatorPage from "./EstimatorPage";
 
 const STORAGE_KEY = "part1module:saved-modules:v1";
 const VIEW_MODE_KEY = "part1module:view-mode:v1";
+const ESTIMATOR_HASH = "#/estimator";
 
 const genId = () => Math.random().toString(36).slice(2, 11);
+
+const getCurrentPage = () => {
+  if (typeof window === "undefined") return "contracts";
+  return window.location.hash === ESTIMATOR_HASH ? "estimator" : "contracts";
+};
 
 const defaultMapping = () => ({
   productName: -1,
@@ -171,6 +179,7 @@ const StatusBadge = ({ status }) => {
 };
 
 export default function App() {
+  const [page, setPage] = useState(() => getCurrentPage());
   const [viewMode, setViewMode] = useState(() => readJsonStorage(VIEW_MODE_KEY, "vendor"));
   const [savedModules, setSavedModules] = useState(() => readJsonStorage(STORAGE_KEY, []));
   const [step, setStep] = useState(-1);
@@ -193,6 +202,47 @@ export default function App() {
   useEffect(() => {
     writeJsonStorage(VIEW_MODE_KEY, viewMode);
   }, [viewMode]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    const syncPageFromLocation = () => {
+      setPage(getCurrentPage());
+    };
+
+    window.addEventListener("hashchange", syncPageFromLocation);
+    window.addEventListener("popstate", syncPageFromLocation);
+
+    return () => {
+      window.removeEventListener("hashchange", syncPageFromLocation);
+      window.removeEventListener("popstate", syncPageFromLocation);
+    };
+  }, []);
+
+  const navigateToPage = (nextPage, options = {}) => {
+    const { replace = false } = options;
+
+    if (typeof window === "undefined") {
+      setPage(nextPage);
+      return;
+    }
+
+    const currentPage = getCurrentPage();
+    if (currentPage === nextPage) {
+      setPage(nextPage);
+      return;
+    }
+
+    const nextUrl =
+      nextPage === "estimator"
+        ? `${window.location.pathname}${window.location.search}${ESTIMATOR_HASH}`
+        : `${window.location.pathname}${window.location.search}`;
+
+    const historyMethod = replace ? "replaceState" : "pushState";
+    window.history[historyMethod]({}, "", nextUrl);
+    setPage(nextPage);
+    window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  };
 
   const resetWizard = () => {
     setEditingId(null);
@@ -1398,6 +1448,10 @@ export default function App() {
     );
   };
 
+  if (page === "estimator") {
+    return <EstimatorPage onBack={() => navigateToPage("contracts", { replace: true })} />;
+  }
+
   const currentModuleForSteps = editingId
     ? savedModules.find((module) => module.id === editingId)
     : null;
@@ -1454,6 +1508,15 @@ export default function App() {
         {step === 2 && Step2View()}
         {step === 3 && TableView()}
       </main>
+
+      <button
+        onClick={() => navigateToPage("estimator")}
+        className="fixed bottom-5 left-5 z-20 inline-flex h-12 w-12 items-center justify-center rounded-full bg-[#0e3f4e] text-white shadow-lg transition-all hover:-translate-y-0.5 hover:bg-[#125366] hover:shadow-xl"
+        title="Open Flexible Estimator"
+        aria-label="Open Flexible Estimator"
+      >
+        <BookOpen size={18} />
+      </button>
     </div>
   );
 }
