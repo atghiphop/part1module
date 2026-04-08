@@ -567,6 +567,418 @@ const getIncludedEstimatorGroupsForPart1Import = (book, groupIds) => {
   return book.groups.filter((group) => selectedGroupIds.has(group.id));
 };
 
+export const ESTIMATOR_IMPORT_IGNORE_SOURCE_ID = "__ignore__";
+
+const getEstimatorImportSourceSlug = (value) => {
+  const normalizedValue = normalizeTextValue(value)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return normalizedValue || "untitled";
+};
+
+const getEstimatorAmountSourceId = (name) => `amount:${getEstimatorImportSourceSlug(name)}`;
+const getEstimatorDiscountSourceId = (name) => `discount:${getEstimatorImportSourceSlug(name)}`;
+const getEstimatorInfoSourceId = (name) => `info:${getEstimatorImportSourceSlug(name)}`;
+
+const getEstimatorImportTargetSourceId = (targetId, amountIdToSourceId) => {
+  if (targetId === "material") return "base:material";
+  if (targetId === "labor") return "base:labor";
+  if (targetId === "equipment") return "base:equipment";
+  return amountIdToSourceId.get(targetId) ?? null;
+};
+
+const getEstimatorImportTextValue = (value) => {
+  const normalizedValue = normalizeTextValue(value).trim();
+  return normalizedValue || "";
+};
+
+const hasEstimatorImportValue = (value, kind) => {
+  if (kind === "text") {
+    return getEstimatorImportTextValue(value).length > 0;
+  }
+
+  return typeof value === "number" && !Number.isNaN(value);
+};
+
+const createEstimatorItemImportPayload = (group, item) => {
+  const pricingMetrics = getEstimatorItemPricingMetrics(item);
+  const sourceDefinitions = new Map();
+  const sourceValues = {};
+  const discountTargetsBySourceId = {};
+  const amountIdToSourceId = new Map();
+
+  const registerSource = (id, label, kind) => {
+    if (!sourceDefinitions.has(id)) {
+      sourceDefinitions.set(id, { id, label, kind });
+    }
+  };
+
+  const setTextValue = (id, value, options = {}) => {
+    const normalizedValue = getEstimatorImportTextValue(value);
+    if (!normalizedValue) {
+      return;
+    }
+
+    if (!sourceValues[id]) {
+      sourceValues[id] = normalizedValue;
+      return;
+    }
+
+    if (options.joinUnique && !sourceValues[id].split(" | ").includes(normalizedValue)) {
+      sourceValues[id] = `${sourceValues[id]} | ${normalizedValue}`;
+    }
+  };
+
+  const setMoneyValue = (id, value, options = {}) => {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+
+    if (options.accumulate) {
+      sourceValues[id] = roundCurrencyValue((sourceValues[id] || 0) + value);
+      return;
+    }
+
+    sourceValues[id] = roundCurrencyValue(value);
+  };
+
+  const setPercentValue = (id, value) => {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+
+    if (sourceValues[id] === undefined) {
+      sourceValues[id] = value;
+      return;
+    }
+
+    if (sourceValues[id] !== null && Math.abs(sourceValues[id] - value) > 0.0001) {
+      sourceValues[id] = null;
+    }
+  };
+
+  registerSource("field:itemName", "Item Name", "text");
+  setTextValue("field:itemName", item.itemName);
+
+  registerSource("field:itemNumber", "Item #", "text");
+  setTextValue("field:itemNumber", getGroupItemNumber(group, item.itemNumber));
+
+  registerSource("field:description", "Description", "text");
+  setTextValue("field:description", item.description);
+
+  registerSource("field:uom", "UOM", "text");
+  setTextValue("field:uom", item.uom);
+
+  registerSource("field:groupName", "Group Name", "text");
+  setTextValue("field:groupName", group.name);
+
+  registerSource("field:pricingStatus", "Pricing Status", "text");
+  setTextValue("field:pricingStatus", PRICING_STATUS_LABELS[item.pricingStatus] || "");
+
+  registerSource("calc:finalTotal", "Final Total", "money");
+  setMoneyValue("calc:finalTotal", pricingMetrics.finalTotal);
+
+  registerSource("calc:preDiscountTotal", "Pre-Discount Total", "money");
+  setMoneyValue("calc:preDiscountTotal", pricingMetrics.preDiscountTotal);
+
+  registerSource("calc:baseSubtotal", "Base Subtotal", "money");
+  setMoneyValue("calc:baseSubtotal", pricingMetrics.baseTotal);
+
+  registerSource("base:material", "Material", "money");
+  setMoneyValue("base:material", parseFloat(item.material) || 0);
+
+  registerSource("base:labor", "Labor", "money");
+  setMoneyValue("base:labor", parseFloat(item.labor) || 0);
+
+  registerSource("base:equipment", "Equipment", "money");
+  setMoneyValue("base:equipment", parseFloat(item.equipment) || 0);
+
+  getActiveOtherEntries(item, "amount").forEach((amount) => {
+    const amountName = getEstimatorImportTextValue(amount.name) || "Amount";
+    const sourceId = getEstimatorAmountSourceId(amountName);
+
+    registerSource(sourceId, `Amount: ${amountName}`, "money");
+    setMoneyValue(sourceId, parseFloat(amount.value), { accumulate: true });
+    amountIdToSourceId.set(amount.id, sourceId);
+  });
+
+  if (pricingMetrics.uniformContractDiscountPercent !== null) {
+    registerSource("discount:uniform", "Uniform Discount %", "percent");
+    setPercentValue("discount:uniform", pricingMetrics.uniformContractDiscountPercent);
+  }
+
+  if (pricingMetrics.hasEstimatorDiscount) {
+    registerSource("discount:effective", "Effective Total Discount %", "percent");
+    setPercentValue("discount:effective", pricingMetrics.effectiveDiscountPercent);
+  }
+
+  getActiveOtherEntries(item, "discount").forEach((discount) => {
+    const discountName = getEstimatorImportTextValue(discount.name) || "Discount";
+    const sourceId = getEstimatorDiscountSourceId(discountName);
+
+    registerSource(sourceId, `Discount: ${discountName}`, "percent");
+    setPercentValue(sourceId, parsePercentLikeValue(discount.percent));
+
+    if (!discountTargetsBySourceId[sourceId]) {
+      discountTargetsBySourceId[sourceId] = new Set();
+    }
+
+    discount.targets.forEach((targetId) => {
+      const targetSourceId = getEstimatorImportTargetSourceId(targetId, amountIdToSourceId);
+      if (targetSourceId) {
+        discountTargetsBySourceId[sourceId].add(targetSourceId);
+      }
+    });
+  });
+
+  getActiveOtherEntries(item, "info").forEach((info) => {
+    const infoName = getEstimatorImportTextValue(info.name) || "Info";
+    const sourceId = getEstimatorInfoSourceId(infoName);
+
+    registerSource(sourceId, `Info: ${infoName}`, "text");
+    setTextValue(sourceId, info.value, { joinUnique: true });
+  });
+
+  return {
+    pricingMetrics,
+    sourceDefinitions: [...sourceDefinitions.values()],
+    sourceValues,
+    discountTargetsBySourceId,
+  };
+};
+
+const pickEstimatorImportDefaultSourceId = (options, preferredIds = []) => {
+  for (const preferredId of preferredIds) {
+    if (options.some((option) => option.id === preferredId)) {
+      return preferredId;
+    }
+  }
+
+  return options[0]?.id ?? ESTIMATOR_IMPORT_IGNORE_SOURCE_ID;
+};
+
+const findRecommendedEstimatorDiscountSourceId = (contexts, percentOptions, pricingMode) => {
+  if (pricingMode !== "contract_discount") {
+    return ESTIMATOR_IMPORT_IGNORE_SOURCE_ID;
+  }
+
+  const percentOptionIds = new Set(percentOptions.map((option) => option.id));
+  const discountedContexts = contexts.filter(
+    ({ item, payload }) => item.pricingStatus === "priced" && payload.pricingMetrics.hasEstimatorDiscount,
+  );
+
+  if (discountedContexts.length === 0) {
+    return ESTIMATOR_IMPORT_IGNORE_SOURCE_ID;
+  }
+
+  const namedDiscountCounts = new Map();
+
+  discountedContexts.forEach(({ payload }) => {
+    const namedDiscountSourceIds = payload.sourceDefinitions
+      .filter(
+        (definition) =>
+          definition.kind === "percent" &&
+          definition.id.startsWith("discount:") &&
+          definition.id !== "discount:uniform" &&
+          definition.id !== "discount:effective" &&
+          hasEstimatorImportValue(payload.sourceValues[definition.id], "percent"),
+      )
+      .map((definition) => definition.id);
+
+    [...new Set(namedDiscountSourceIds)].forEach((sourceId) => {
+      namedDiscountCounts.set(sourceId, (namedDiscountCounts.get(sourceId) || 0) + 1);
+    });
+  });
+
+  const consistentNamedDiscount = [...namedDiscountCounts.entries()].find(
+    ([sourceId, count]) => count === discountedContexts.length && percentOptionIds.has(sourceId),
+  );
+
+  if (consistentNamedDiscount) {
+    return consistentNamedDiscount[0];
+  }
+
+  if (percentOptionIds.has("discount:uniform")) {
+    return "discount:uniform";
+  }
+
+  const mostCommonNamedDiscount = [...namedDiscountCounts.entries()].sort((left, right) => {
+    if (right[1] !== left[1]) {
+      return right[1] - left[1];
+    }
+
+    return left[0].localeCompare(right[0]);
+  })[0];
+
+  if (mostCommonNamedDiscount && percentOptionIds.has(mostCommonNamedDiscount[0])) {
+    return mostCommonNamedDiscount[0];
+  }
+
+  if (percentOptionIds.has("discount:effective")) {
+    return "discount:effective";
+  }
+
+  return percentOptions[0]?.id ?? ESTIMATOR_IMPORT_IGNORE_SOURCE_ID;
+};
+
+const findRecommendedEstimatorMsrpSourceId = (
+  contexts,
+  moneyOptions,
+  pricingMode,
+  discountSourceId,
+) => {
+  const moneyOptionIds = new Set(moneyOptions.map((option) => option.id));
+
+  if (pricingMode !== "contract_discount") {
+    return pickEstimatorImportDefaultSourceId(moneyOptions, ["calc:finalTotal"]);
+  }
+
+  if (discountSourceId && discountSourceId !== ESTIMATOR_IMPORT_IGNORE_SOURCE_ID) {
+    const targetCounts = new Map();
+    let contextsWithTargets = 0;
+
+    contexts.forEach(({ item, payload }) => {
+      if (item.pricingStatus !== "priced") {
+        return;
+      }
+
+      const matchingTargets = payload.discountTargetsBySourceId[discountSourceId];
+      if (!matchingTargets || matchingTargets.size !== 1) {
+        return;
+      }
+
+      const [targetSourceId] = [...matchingTargets];
+      if (!moneyOptionIds.has(targetSourceId)) {
+        return;
+      }
+
+      contextsWithTargets += 1;
+      targetCounts.set(targetSourceId, (targetCounts.get(targetSourceId) || 0) + 1);
+    });
+
+    const consistentTarget = [...targetCounts.entries()].find(
+      ([sourceId, count]) => count === contextsWithTargets && contextsWithTargets > 0,
+    );
+
+    if (consistentTarget) {
+      return consistentTarget[0];
+    }
+
+    const mostCommonTarget = [...targetCounts.entries()].sort((left, right) => {
+      if (right[1] !== left[1]) {
+        return right[1] - left[1];
+      }
+
+      return left[0].localeCompare(right[0]);
+    })[0];
+
+    if (mostCommonTarget) {
+      return mostCommonTarget[0];
+    }
+  }
+
+  return pickEstimatorImportDefaultSourceId(moneyOptions, [
+    "calc:preDiscountTotal",
+    "calc:finalTotal",
+    "calc:baseSubtotal",
+  ]);
+};
+
+export const getEstimatorBookImportConfig = (storedBook, options = {}) => {
+  const book = normalizeStoredBook(storedBook);
+  const includedGroups = getIncludedEstimatorGroupsForPart1Import(book, options?.groupIds);
+  const sourceMap = new Map();
+  const contexts = [];
+  let itemCount = 0;
+
+  includedGroups.forEach((group) => {
+    group.items.forEach((item) => {
+      if (!estimatorItemHasContractData(group, item)) {
+        return;
+      }
+
+      itemCount += 1;
+
+      const payload = createEstimatorItemImportPayload(group, item);
+      contexts.push({ group, item, payload });
+
+      payload.sourceDefinitions.forEach((definition) => {
+        if (!sourceMap.has(definition.id)) {
+          sourceMap.set(definition.id, { ...definition, populatedItemCount: 0 });
+        }
+
+        if (hasEstimatorImportValue(payload.sourceValues[definition.id], definition.kind)) {
+          sourceMap.get(definition.id).populatedItemCount += 1;
+        }
+      });
+    });
+  });
+
+  const allSources = [...sourceMap.values()].map((definition) => ({
+    ...definition,
+    optionLabel:
+      itemCount > 0 && definition.populatedItemCount < itemCount
+        ? `${definition.label} (${definition.populatedItemCount}/${itemCount} items)`
+        : definition.label,
+  }));
+
+  const textSources = allSources.filter((definition) => definition.kind === "text");
+  const moneySources = allSources.filter((definition) => definition.kind === "money");
+  const percentSources = allSources.filter((definition) => definition.kind === "percent");
+
+  const pricingMode =
+    options?.pricingMode === "contract_discount" ? "contract_discount" : "final_price";
+  const recommendedDiscountSourceId = findRecommendedEstimatorDiscountSourceId(
+    contexts,
+    percentSources,
+    pricingMode,
+  );
+  const recommendedMsrpSourceId = findRecommendedEstimatorMsrpSourceId(
+    contexts,
+    moneySources,
+    pricingMode,
+    recommendedDiscountSourceId,
+  );
+
+  return {
+    itemCount,
+    sources: allSources,
+    fieldOptions: {
+      productName: textSources,
+      productNumber: textSources,
+      description: textSources,
+      units: textSources,
+      msrp: moneySources,
+      discount: percentSources,
+    },
+    defaultMapping: {
+      productName: pickEstimatorImportDefaultSourceId(textSources, [
+        "field:itemName",
+        "field:description",
+        "field:groupName",
+      ]),
+      productNumber: pickEstimatorImportDefaultSourceId(textSources, [
+        "field:itemNumber",
+        "field:itemName",
+      ]),
+      description: pickEstimatorImportDefaultSourceId(textSources, [
+        "field:description",
+        "field:groupName",
+        "field:itemName",
+      ]),
+      units: pickEstimatorImportDefaultSourceId(textSources, ["field:uom", "field:description"]),
+      msrp: recommendedMsrpSourceId,
+      discount:
+        pricingMode === "contract_discount"
+          ? recommendedDiscountSourceId
+          : ESTIMATOR_IMPORT_IGNORE_SOURCE_ID,
+    },
+  };
+};
+
 export const summarizeEstimatorBookForPart1Import = (storedBook, options = {}) => {
   const book = normalizeStoredBook(storedBook);
   const includedGroups = getIncludedEstimatorGroupsForPart1Import(book, options?.groupIds);
@@ -603,11 +1015,59 @@ export const summarizeEstimatorBookForPart1Import = (storedBook, options = {}) =
   return summary;
 };
 
+const resolveEstimatorImportMapping = (config, mapping = null) => {
+  const fieldKeys = ["productName", "productNumber", "description", "units", "msrp", "discount"];
+  const resolvedMapping = {};
+
+  fieldKeys.forEach((fieldKey) => {
+    const validOptionIds = new Set(config.fieldOptions[fieldKey].map((option) => option.id));
+    const mappedValue = mapping?.[fieldKey];
+
+    if (mappedValue === ESTIMATOR_IMPORT_IGNORE_SOURCE_ID || validOptionIds.has(mappedValue)) {
+      resolvedMapping[fieldKey] = mappedValue;
+      return;
+    }
+
+    resolvedMapping[fieldKey] = config.defaultMapping[fieldKey];
+  });
+
+  return resolvedMapping;
+};
+
+const getEstimatorMappedTextValue = (payload, sourceId) => {
+  if (!sourceId || sourceId === ESTIMATOR_IMPORT_IGNORE_SOURCE_ID) {
+    return "";
+  }
+
+  return getEstimatorImportTextValue(payload.sourceValues[sourceId]);
+};
+
+const getEstimatorMappedMoneyValue = (payload, sourceId) => {
+  if (!sourceId || sourceId === ESTIMATOR_IMPORT_IGNORE_SOURCE_ID) {
+    return "";
+  }
+
+  const value = payload.sourceValues[sourceId];
+  return Number.isFinite(value) ? formatContractCurrencyValue(value) : "";
+};
+
+const getEstimatorMappedPercentValue = (payload, sourceId) => {
+  if (!sourceId || sourceId === ESTIMATOR_IMPORT_IGNORE_SOURCE_ID) {
+    return 0;
+  }
+
+  const value = payload.sourceValues[sourceId];
+  return Number.isFinite(value) ? toContractPercentValue(value) : 0;
+};
+
 export const buildPart1RowsFromEstimatorBook = (storedBook, vendorName = "", options = {}) => {
   const book = normalizeStoredBook(storedBook);
   const manufacturer = normalizeTextValue(vendorName).trim();
-  const pricingMode =
-    options?.pricingMode === "contract_discount" ? "contract_discount" : "final_price";
+  const importConfig = getEstimatorBookImportConfig(book, {
+    groupIds: options?.groupIds,
+    pricingMode: options?.pricingMode,
+  });
+  const resolvedMapping = resolveEstimatorImportMapping(importConfig, options?.mapping);
   const includedGroups = getIncludedEstimatorGroupsForPart1Import(book, options?.groupIds);
   const rows = [];
 
@@ -617,76 +1077,29 @@ export const buildPart1RowsFromEstimatorBook = (storedBook, vendorName = "", opt
         return;
       }
 
-      const productNumber = getGroupItemNumber(group, item.itemNumber);
-      const groupName = normalizeTextValue(group.name).trim();
       const pricingStatusLabel = PRICING_STATUS_LABELS[item.pricingStatus] || "Priced";
-      const amountSummary = getOtherSummary(item, "amount");
-      const discountSummary = getOtherSummary(item, "discount");
-      const infoSummary = getOtherSummary(item, "info");
-      const pricingMetrics = getEstimatorItemPricingMetrics(item);
-      const shouldImportEstimatorDiscount =
-        pricingMode === "contract_discount" &&
-        item.pricingStatus === "priced" &&
-        pricingMetrics.canRepresentAsContractDiscount;
-      const descriptionParts = [];
-      let msrpValue =
+      const payload = createEstimatorItemImportPayload(group, item);
+      const productName = getEstimatorMappedTextValue(payload, resolvedMapping.productName);
+      const productNumber = getEstimatorMappedTextValue(payload, resolvedMapping.productNumber);
+      const description = getEstimatorMappedTextValue(payload, resolvedMapping.description);
+      const units = getEstimatorMappedTextValue(payload, resolvedMapping.units);
+      const msrpValue =
         item.pricingStatus === "priced"
-          ? roundToTwo(pricingMetrics.finalTotal).toFixed(2)
+          ? getEstimatorMappedMoneyValue(payload, resolvedMapping.msrp)
           : pricingStatusLabel;
-      let discountValue = 0;
-
-      if (normalizeTextValue(item.description).trim()) {
-        descriptionParts.push(normalizeTextValue(item.description).trim());
-      }
-
-      if (groupName) {
-        descriptionParts.push(`Estimator group: ${groupName}`);
-      }
-
-      if (item.pricingStatus !== "priced") {
-        descriptionParts.push(`Pricing status: ${pricingStatusLabel}`);
-      }
-
-      if (shouldImportEstimatorDiscount) {
-        const resolvedContractDiscountPercent =
-          pricingMetrics.uniformContractDiscountPercent ?? pricingMetrics.effectiveDiscountPercent;
-        discountValue = toContractPercentValue(resolvedContractDiscountPercent);
-        msrpValue = formatContractCurrencyValue(pricingMetrics.preDiscountTotal);
-        descriptionParts.push("Estimator pricing imported as MSRP plus contract discount.");
-      } else if (pricingMetrics.hasEstimatorDiscount) {
-        descriptionParts.push("Estimator final total already includes discounts.");
-
-        if (
-          pricingMode === "contract_discount" &&
-          !pricingMetrics.canRepresentAsContractDiscount &&
-          item.pricingStatus === "priced"
-        ) {
-          descriptionParts.push(
-            "Estimator discounts could not be converted into a single contract discount, so the final price was imported with 0% contract discount.",
-          );
-        }
-      }
-
-      if (amountSummary !== "--") {
-        descriptionParts.push(`Additional amounts: ${amountSummary}`);
-      }
-
-      if (discountSummary !== "--") {
-        descriptionParts.push(`Estimator discounts: ${discountSummary}`);
-      }
-
-      if (infoSummary !== "--") {
-        descriptionParts.push(`Notes: ${infoSummary}`);
-      }
+      const discountValue =
+        item.pricingStatus === "priced"
+          ? getEstimatorMappedPercentValue(payload, resolvedMapping.discount)
+          : 0;
 
       rows.push({
         id: generateId(),
         manufacturer: manufacturer || "",
         website: "",
-        productName: normalizeTextValue(item.itemName).trim() || groupName || "Estimator Item",
+        productName,
         productNumber,
-        description: descriptionParts.join(" | "),
-        units: normalizeTextValue(item.uom).trim(),
+        description,
+        units,
         msrp: msrpValue,
         discount: discountValue,
       });

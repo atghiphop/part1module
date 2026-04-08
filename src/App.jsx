@@ -20,7 +20,9 @@ import {
 } from "lucide-react";
 import EstimatorPage, {
   ESTIMATOR_BOOKS_STORAGE_KEY,
+  ESTIMATOR_IMPORT_IGNORE_SOURCE_ID,
   buildPart1RowsFromEstimatorBook,
+  getEstimatorBookImportConfig,
   getBookItemCount,
   normalizeStoredBooks,
   summarizeEstimatorBookForPart1Import,
@@ -45,6 +47,15 @@ const defaultMapping = () => ({
   msrp: -1,
   discount: -1,
 });
+
+const ESTIMATOR_MAPPING_FIELDS = [
+  { key: "productName", label: "Product Name" },
+  { key: "productNumber", label: "Product #" },
+  { key: "description", label: "Description" },
+  { key: "units", label: "Units description" },
+  { key: "msrp", label: "MSRP / Pricing" },
+  { key: "discount", label: "Discount %" },
+];
 
 const createEmptyCatalog = () => ({
   id: genId(),
@@ -206,6 +217,7 @@ export default function App() {
   const [selectedEstimatorBookSnapshot, setSelectedEstimatorBookSnapshot] = useState(null);
   const [selectedEstimatorGroupIds, setSelectedEstimatorGroupIds] = useState([]);
   const [estimatorPricingMode, setEstimatorPricingMode] = useState(null);
+  const [estimatorImportMapping, setEstimatorImportMapping] = useState(null);
   const [tableData, setTableData] = useState([]);
   const [annotations, setAnnotations] = useState({ global: "", rows: {} });
 
@@ -292,6 +304,66 @@ export default function App() {
     setSelectedEstimatorGroupIds(availableGroupIds.filter((groupId) => groupIds.includes(groupId)));
   };
 
+  const getCurrentEstimatorImportConfig = (book = getSelectedEstimatorBook()) => {
+    if (!book) {
+      return null;
+    }
+
+    return getEstimatorBookImportConfig(book, {
+      groupIds: selectedEstimatorGroupIds,
+      pricingMode: estimatorPricingMode,
+    });
+  };
+
+  const reconcileEstimatorImportMapping = (currentMapping, config) => {
+    if (!config) {
+      return null;
+    }
+
+    const nextMapping = {};
+
+    ESTIMATOR_MAPPING_FIELDS.forEach(({ key }) => {
+      const validOptionIds = new Set(config.fieldOptions[key].map((option) => option.id));
+      const currentValue = currentMapping?.[key];
+
+      if (
+        currentValue === ESTIMATOR_IMPORT_IGNORE_SOURCE_ID ||
+        validOptionIds.has(currentValue)
+      ) {
+        nextMapping[key] = currentValue;
+        return;
+      }
+
+      nextMapping[key] = config.defaultMapping[key];
+    });
+
+    return nextMapping;
+  };
+
+  useEffect(() => {
+    if (!useExistingBook) {
+      setEstimatorImportMapping(null);
+      return;
+    }
+
+    const config = getCurrentEstimatorImportConfig();
+    if (!config) {
+      setEstimatorImportMapping(null);
+      return;
+    }
+
+    setEstimatorImportMapping((currentMapping) =>
+      reconcileEstimatorImportMapping(currentMapping, config),
+    );
+  }, [
+    useExistingBook,
+    estimatorBooks,
+    selectedEstimatorBookId,
+    selectedEstimatorBookSnapshot,
+    selectedEstimatorGroupIds,
+    estimatorPricingMode,
+  ]);
+
   const handleUseExistingBookChange = (value) => {
     setUseExistingBook(value);
 
@@ -300,6 +372,7 @@ export default function App() {
       setSelectedEstimatorBookSnapshot(null);
       setSelectedEstimatorGroupIds([]);
       setEstimatorPricingMode(null);
+      setEstimatorImportMapping(null);
       return;
     }
 
@@ -311,18 +384,21 @@ export default function App() {
       setSelectedEstimatorBookSnapshot(cloneData(nextBook));
       applyEstimatorGroupSelection(nextBook);
       setEstimatorPricingMode(null);
+      setEstimatorImportMapping(null);
       return;
     }
 
     if (selectedEstimatorBookSnapshot?.id) {
       setSelectedEstimatorBookId(selectedEstimatorBookSnapshot.id);
       applyEstimatorGroupSelection(selectedEstimatorBookSnapshot);
+      setEstimatorImportMapping(null);
     }
   };
 
   const handleEstimatorBookSelect = (bookId) => {
     setSelectedEstimatorBookId(bookId);
     setEstimatorPricingMode(null);
+    setEstimatorImportMapping(null);
 
     const selectedBook =
       estimatorBooks.find((book) => book.id === bookId) ??
@@ -359,6 +435,13 @@ export default function App() {
 
   const handleClearEstimatorGroups = () => {
     setSelectedEstimatorGroupIds([]);
+  };
+
+  const handleEstimatorImportMappingChange = (fieldKey, sourceId) => {
+    setEstimatorImportMapping((currentMapping) => ({
+      ...(currentMapping || {}),
+      [fieldKey]: sourceId,
+    }));
   };
 
   const navigateToPage = (nextPage, options = {}) => {
@@ -401,6 +484,7 @@ export default function App() {
     setSelectedEstimatorBookSnapshot(null);
     setSelectedEstimatorGroupIds([]);
     setEstimatorPricingMode(null);
+    setEstimatorImportMapping(null);
     setTableData([]);
     setAnnotations({ global: "", rows: {} });
     setStep(0);
@@ -430,6 +514,7 @@ export default function App() {
       selectedEstimatorBookSnapshot: resolvedEstimatorBookSnapshot,
       selectedEstimatorGroupIds,
       estimatorPricingMode,
+      estimatorImportMapping,
       status,
       annotations,
     };
@@ -468,6 +553,7 @@ export default function App() {
       Array.isArray(module.selectedEstimatorGroupIds) ? module.selectedEstimatorGroupIds : null,
     );
     setEstimatorPricingMode(module.estimatorPricingMode ?? null);
+    setEstimatorImportMapping(module.estimatorImportMapping ? cloneData(module.estimatorImportMapping) : null);
 
     setAnnotations(cloneData(module.annotations || { global: "", rows: {} }));
     setConfirmingSubmit(action === "confirm");
@@ -593,6 +679,7 @@ export default function App() {
       newTable.push(
         ...buildPart1RowsFromEstimatorBook(selectedEstimatorBook, vendorName, {
           groupIds: selectedEstimatorGroupIds,
+          mapping: estimatorImportMapping,
           pricingMode: estimatorPricingMode,
         }),
       );
@@ -956,6 +1043,9 @@ export default function App() {
     const showExistingBookQuestion =
       estimatorBooks.length > 0 || useExistingBook === true || Boolean(selectedEstimatorBookSnapshot);
     const selectedEstimatorBook = useExistingBook ? getSelectedEstimatorBook() : null;
+    const estimatorImportConfig = selectedEstimatorBook
+      ? getCurrentEstimatorImportConfig(selectedEstimatorBook)
+      : null;
     const selectedEstimatorBookSummary = selectedEstimatorBook
       ? summarizeEstimatorBookForPart1Import(selectedEstimatorBook, {
           groupIds: selectedEstimatorGroupIds,
@@ -973,6 +1063,11 @@ export default function App() {
     const hasSelectedEstimatorGroups = !hasEstimatorGroupsToChoose || selectedEstimatorGroupCount > 0;
     const requiresEstimatorPricingQuestion =
       (selectedEstimatorBookSummary?.discountedItemCount ?? 0) > 0;
+    const shouldShowEstimatorMapping =
+      Boolean(selectedEstimatorBook) &&
+      hasSelectedEstimatorGroups &&
+      (!requiresEstimatorPricingQuestion || Boolean(estimatorPricingMode)) &&
+      Boolean(estimatorImportConfig);
     const catalogQuestionNumber = showExistingBookQuestion ? 5 : 4;
     const directImportQuestionNumber = showExistingBookQuestion ? 6 : 5;
 
@@ -983,16 +1078,9 @@ export default function App() {
           Map Your Columns
         </h4>
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-          {[
-            { key: "productName", label: "Product Name" },
-            { key: "productNumber", label: "Product #" },
-            { key: "description", label: "Description" },
-            { key: "units", label: "Units description" },
-            { key: "msrp", label: "MSRP / Pricing" },
-            { key: "discount", label: "Discount %" },
-          ].map((field) => (
+          {ESTIMATOR_MAPPING_FIELDS.map((field) => (
             <div key={field.key} className="flex flex-col">
-              <label className="text-xs font-bold text-gray-600 uppercase tracking-wider mb-2">
+              <label className="mb-2 flex min-h-[3rem] items-end text-xs font-bold uppercase tracking-wider text-gray-600">
                 {field.label}
               </label>
               <select
@@ -1013,12 +1101,51 @@ export default function App() {
       </div>
     );
 
+    const EstimatorColumnsUI = ({ config, mapping, onMapChange }) => (
+      <div className="mt-5 rounded-xl border border-[#0e3f4e]/20 bg-white p-5 shadow-sm">
+        <h4 className="font-semibold text-[#0e3f4e] mb-2 flex items-center">
+          <CheckCircle2 size={18} className="mr-2 text-[#7eb03e]" />
+          Confirm Book Field Mapping
+        </h4>
+        <p className="text-sm text-gray-600 mb-4">
+          We guessed how the selected estimator groups should map into the Part 1 contract. Review
+          each field before creating the table.
+        </p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+          {ESTIMATOR_MAPPING_FIELDS.map((field) => (
+            <div key={field.key} className="flex flex-col">
+              <label className="mb-2 flex min-h-[3rem] items-end text-xs font-bold uppercase tracking-wider text-gray-600">
+                {field.label}
+              </label>
+              <select
+                value={mapping?.[field.key] ?? ESTIMATOR_IMPORT_IGNORE_SOURCE_ID}
+                onChange={(event) => onMapChange(field.key, event.target.value)}
+                className="w-full text-sm border-gray-300 rounded-md shadow-sm focus:border-[#0e3f4e] focus:ring-[#0e3f4e] py-2"
+              >
+                <option value={ESTIMATOR_IMPORT_IGNORE_SOURCE_ID}>-- Ignore --</option>
+                {config.fieldOptions[field.key].map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.optionLabel}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ))}
+        </div>
+        <p className="mt-4 text-xs text-gray-500">
+          Tip: choose a specific amount source such as `Amount: Price/Ctn` for MSRP and a matching
+          estimator discount source for `% Discount` when your book stores multiple price fields.
+        </p>
+      </div>
+    );
+
     const canProceed =
       usingThirdParty !== null &&
       directImport.hasLineItems !== null &&
       (!showExistingBookQuestion || useExistingBook !== null) &&
       (!useExistingBook || (Boolean(selectedEstimatorBook) && hasSelectedEstimatorGroups)) &&
-      (!requiresEstimatorPricingQuestion || Boolean(estimatorPricingMode));
+      (!requiresEstimatorPricingQuestion || Boolean(estimatorPricingMode)) &&
+      (!shouldShowEstimatorMapping || Boolean(estimatorImportMapping));
 
     return (
       <div className="max-w-5xl mx-auto animate-in slide-in-from-right-8 fade-in duration-300">
@@ -1232,12 +1359,20 @@ export default function App() {
                         <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
                           {selectedEstimatorBookSummary.fallbackDiscountItemCount} discounted item
                           {selectedEstimatorBookSummary.fallbackDiscountItemCount === 1 ? "" : "s"}{" "}
-                          cannot be converted into one clean contract discount. If you choose
-                          Import MSRP + Discount, those rows will fall back to final price with 0%
-                          discount.
+                          do not auto-convert cleanly into a single contract discount. Review the
+                          mapping below and choose the exact MSRP and discount sources you want to
+                          use.
                         </div>
                       )}
                     </div>
+                  )}
+
+                  {shouldShowEstimatorMapping && estimatorImportConfig && estimatorImportMapping && (
+                    <EstimatorColumnsUI
+                      config={estimatorImportConfig}
+                      mapping={estimatorImportMapping}
+                      onMapChange={handleEstimatorImportMappingChange}
+                    />
                   )}
                 </div>
               )}
