@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   BookOpen,
   Building2,
@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import EstimatorPage, {
   ESTIMATOR_BOOKS_STORAGE_KEY,
+  getEstimatorImportFixedSourceId,
   ESTIMATOR_IMPORT_IGNORE_SOURCE_ID,
   buildPart1RowsFromEstimatorBook,
   getEstimatorBookImportConfig,
@@ -31,6 +32,7 @@ import EstimatorPage, {
 const STORAGE_KEY = "part1module:saved-modules:v1";
 const VIEW_MODE_KEY = "part1module:view-mode:v1";
 const ESTIMATOR_HASH = "#/estimator";
+const CONTRACT_IMPORT_TEMPLATES_STORAGE_KEY = "part1module:contract-import-templates:v1";
 
 const genId = () => Math.random().toString(36).slice(2, 11);
 
@@ -56,6 +58,330 @@ const ESTIMATOR_MAPPING_FIELDS = [
   { key: "msrp", label: "MSRP / Pricing" },
   { key: "discount", label: "Discount %" },
 ];
+const ESTIMATOR_BOOK_OPTIONAL_FIELDS = [
+  { key: "manufacturer", label: "Manufacturer", allowFixed: true },
+  { key: "website", label: "Website", allowFixed: true },
+];
+const ESTIMATOR_BOOK_IMPORT_MAPPING_FIELDS = [
+  ...ESTIMATOR_BOOK_OPTIONAL_FIELDS,
+  ...ESTIMATOR_MAPPING_FIELDS,
+];
+const CONTRACT_IMPORT_FIELD_KEYS = ESTIMATOR_MAPPING_FIELDS.map((field) => field.key);
+const CONTRACT_IMPORT_PREVIEW_ROW_LIMIT = 5;
+
+const normalizeContractImportMappingTypes = (value) => {
+  const rawTypes = Array.isArray(value)
+    ? value
+    : Array.isArray(value?.types)
+      ? value.types
+      : typeof value === "string"
+        ? [value]
+        : typeof value?.type === "string"
+          ? [value.type]
+          : [];
+
+  return Array.from(new Set(rawTypes.filter((type) => CONTRACT_IMPORT_FIELD_KEYS.includes(type)))).sort(
+    (left, right) => CONTRACT_IMPORT_FIELD_KEYS.indexOf(left) - CONTRACT_IMPORT_FIELD_KEYS.indexOf(right),
+  );
+};
+
+const createContractImportColumnMappingState = (value = []) => {
+  const types = normalizeContractImportMappingTypes(value);
+
+  return {
+    type: types[0] ?? "ignore",
+    types,
+  };
+};
+
+const createEmptyContractImportColumnMapping = () => ({
+  ...createContractImportColumnMappingState(),
+  isFixed: false,
+  fixedValue: "",
+  customName: "",
+});
+
+const contractImportMappingHasType = (mapping, type) =>
+  normalizeContractImportMappingTypes(mapping).includes(type);
+
+const contractImportMappingIsIgnored = (mapping) =>
+  normalizeContractImportMappingTypes(mapping).length === 0;
+
+const normalizeContractImportColumnMapping = (mapping) => ({
+  ...createEmptyContractImportColumnMapping(),
+  ...createContractImportColumnMappingState(mapping),
+  isFixed: mapping?.isFixed === true,
+  fixedValue: typeof mapping?.fixedValue === "string" ? mapping.fixedValue : "",
+  customName: typeof mapping?.customName === "string" ? mapping.customName : "",
+});
+
+const parseSpreadsheetText = (text) => {
+  if (!text || !text.trim()) {
+    return [];
+  }
+
+  let delimiter = "\t";
+  if (!text.includes("\t") && text.includes(",")) {
+    delimiter = ",";
+  }
+
+  return text
+    .split("\n")
+    .filter((row) => row.trim() !== "")
+    .map((row) => row.split(delimiter).map((cell) => cell.trim()));
+};
+
+const getParsedColumnCount = (rows) =>
+  Array.isArray(rows) && rows.length > 0 ? rows.reduce((max, row) => Math.max(max, row.length), 0) : 0;
+
+const getCombinedHeaderFromRows = (rows, headerRowCount, colIndex) => {
+  if (headerRowCount === 0) {
+    return `Column ${colIndex + 1}`;
+  }
+
+  const headerText = [];
+  for (let index = 0; index < headerRowCount; index += 1) {
+    if (rows[index] && rows[index][colIndex]) {
+      headerText.push(rows[index][colIndex].trim());
+    }
+  }
+
+  return headerText.join(" ").trim() || `Column ${colIndex + 1}`;
+};
+
+const autoMapHeaders = (headers) => ({
+  productName: headers.findIndex(
+    (header) => header.toLowerCase().includes("name") || header.toLowerCase().includes("item"),
+  ),
+  productNumber: headers.findIndex(
+    (header) =>
+      header.toLowerCase().includes("#") ||
+      header.toLowerCase().includes("num") ||
+      header.toLowerCase().includes("sku"),
+  ),
+  description: headers.findIndex((header) => header.toLowerCase().includes("desc")),
+  units: headers.findIndex(
+    (header) => header.toLowerCase().includes("unit") || header.toLowerCase().includes("uom"),
+  ),
+  msrp: headers.findIndex(
+    (header) =>
+      header.toLowerCase().includes("msrp") ||
+      header.toLowerCase().includes("price") ||
+      header.toLowerCase().includes("cost"),
+  ),
+  discount: headers.findIndex(
+    (header) => header.toLowerCase().includes("disc") || header.toLowerCase().includes("%"),
+  ),
+});
+
+const buildColumnMappingsFromFieldSelections = (fieldSelections, columnCount) => {
+  const nextMappings = Array.from({ length: columnCount }, () => createEmptyContractImportColumnMapping());
+
+  ESTIMATOR_MAPPING_FIELDS.forEach(({ key }) => {
+    const sourceIndex = fieldSelections?.[key];
+    if (!Number.isInteger(sourceIndex) || sourceIndex < 0 || sourceIndex >= columnCount) {
+      return;
+    }
+
+    const currentMapping = nextMappings[sourceIndex];
+    nextMappings[sourceIndex] = {
+      ...currentMapping,
+      ...createContractImportColumnMappingState([
+        ...normalizeContractImportMappingTypes(currentMapping),
+        key,
+      ]),
+    };
+  });
+
+  return nextMappings;
+};
+
+const createAutoMappedContractImportColumnMappings = (rows, headerRowCount = 1) => {
+  const columnCount = getParsedColumnCount(rows);
+  const headers = Array.from({ length: columnCount }, (_, index) =>
+    getCombinedHeaderFromRows(rows, headerRowCount, index),
+  );
+
+  return buildColumnMappingsFromFieldSelections(autoMapHeaders(headers), columnCount);
+};
+
+const deriveLegacyFieldSelectionsFromColumnMappings = (columnMappings, parsedColumnCount) => {
+  const nextSelections = defaultMapping();
+
+  ESTIMATOR_MAPPING_FIELDS.forEach(({ key }) => {
+    const selectedIndex = columnMappings.findIndex(
+      (mapping, index) =>
+        index < parsedColumnCount && mapping?.isFixed !== true && contractImportMappingHasType(mapping, key),
+    );
+
+    nextSelections[key] = selectedIndex >= 0 ? selectedIndex : -1;
+  });
+
+  return nextSelections;
+};
+
+const normalizeContractImportSource = (source = {}) => {
+  const parsedFromPastedData =
+    typeof source?.pastedData === "string" ? parseSpreadsheetText(source.pastedData) : [];
+  const parsedFromLegacyRows =
+    Array.isArray(source?.headers) || Array.isArray(source?.rows)
+      ? [
+          Array.isArray(source?.headers) ? source.headers : [],
+          ...(Array.isArray(source?.rows) ? source.rows : []),
+        ]
+      : [];
+  const parsedData =
+    Array.isArray(source?.parsedData) && source.parsedData.length > 0
+      ? source.parsedData.map((row) =>
+          Array.isArray(row) ? row.map((cell) => (cell == null ? "" : String(cell))) : [],
+        )
+      : parsedFromPastedData.length > 0
+        ? parsedFromPastedData
+        : parsedFromLegacyRows;
+  const parsedColumnCount = getParsedColumnCount(parsedData);
+  const maxHeaderRowCount = Math.max(0, parsedData.length - 1);
+  const requestedHeaderRows =
+    typeof source?.headerRowCount === "number"
+      ? source.headerRowCount
+      : parsedData.length > 0
+        ? 1
+        : 0;
+  const headerRowCount = Math.min(Math.max(requestedHeaderRows, 0), maxHeaderRowCount);
+  const hasStoredColumnMappings =
+    Array.isArray(source?.columnMappings) && source.columnMappings.length > 0;
+  const baseColumnMappings = hasStoredColumnMappings
+    ? source.columnMappings.map(normalizeContractImportColumnMapping)
+    : parsedColumnCount > 0
+      ? buildColumnMappingsFromFieldSelections(
+          Object.values(source?.mapping || {}).some((value) => Number.isInteger(value) && value >= 0)
+            ? source.mapping
+            : autoMapHeaders(
+                Array.from({ length: parsedColumnCount }, (_, index) =>
+                  getCombinedHeaderFromRows(parsedData, headerRowCount, index),
+                ),
+              ),
+          parsedColumnCount,
+        )
+      : [];
+  const columnMappings =
+    baseColumnMappings.length >= parsedColumnCount
+      ? baseColumnMappings
+      : [
+          ...baseColumnMappings,
+          ...Array.from(
+            { length: parsedColumnCount - baseColumnMappings.length },
+            () => createEmptyContractImportColumnMapping(),
+          ),
+        ];
+  const headers = Array.from({ length: parsedColumnCount }, (_, index) =>
+    getCombinedHeaderFromRows(parsedData, headerRowCount, index),
+  );
+  const rows = parsedData
+    .slice(headerRowCount)
+    .filter((row) => row.some((cell) => String(cell ?? "").trim() !== ""));
+
+  return {
+    ...source,
+    pastedData:
+      typeof source?.pastedData === "string"
+        ? source.pastedData
+        : parsedData.map((row) => row.join("\t")).join("\n"),
+    parsedData,
+    headerRowCount,
+    columnMappings,
+    selectedTemplateId: typeof source?.selectedTemplateId === "string" ? source.selectedTemplateId : "",
+    headers,
+    rows,
+    mapping: deriveLegacyFieldSelectionsFromColumnMappings(columnMappings, parsedColumnCount),
+  };
+};
+
+const normalizeStoredContractImportTemplates = (storedTemplates) => {
+  if (!Array.isArray(storedTemplates)) {
+    return [];
+  }
+
+  return storedTemplates.filter(
+    (template) =>
+      template &&
+      typeof template.id === "string" &&
+      typeof template.name === "string" &&
+      Array.isArray(template.mappings),
+  );
+};
+
+const parseImportedDiscountValue = (value) => {
+  if (value == null || String(value).trim() === "") {
+    return null;
+  }
+
+  const parsedValue = parseFloat(String(value).replace(/[^0-9.-]+/g, ""));
+  return Number.isNaN(parsedValue) ? null : parsedValue;
+};
+
+const buildContractRowsFromImportSource = (source, options = {}) => {
+  const normalizedSource = normalizeContractImportSource(source);
+  const hasMappedColumns = normalizedSource.columnMappings.some(
+    (mapping) => !contractImportMappingIsIgnored(mapping),
+  );
+
+  if (!hasMappedColumns) {
+    return [];
+  }
+
+  return normalizedSource.rows
+    .map((row) => {
+      const nextRow = {
+        id: genId(),
+        manufacturer: options.manufacturer || "",
+        website: options.website || "",
+        productName: "",
+        productNumber: "",
+        description: "",
+        units: "",
+        msrp: "",
+        discount: options.hasStandardDiscount ? options.discountPercent : 0,
+      };
+      let hasMappedValue = false;
+      let mappedDiscountValue = null;
+
+      normalizedSource.columnMappings.forEach((mapping, columnIndex) => {
+        const mappedTypes = normalizeContractImportMappingTypes(mapping);
+        if (mappedTypes.length === 0) {
+          return;
+        }
+
+        const rawValue = mapping.isFixed ? mapping.fixedValue : row[columnIndex];
+        const value = rawValue ? String(rawValue).trim() : "";
+
+        mappedTypes.forEach((fieldKey) => {
+          if (fieldKey === "discount") {
+            const parsedDiscountValue = parseImportedDiscountValue(value);
+            if (parsedDiscountValue !== null) {
+              mappedDiscountValue = parsedDiscountValue;
+              hasMappedValue = true;
+            }
+            return;
+          }
+
+          if (value) {
+            nextRow[fieldKey] = value;
+            hasMappedValue = true;
+          }
+        });
+      });
+
+      nextRow.discount =
+        mappedDiscountValue !== null
+          ? mappedDiscountValue
+          : options.hasStandardDiscount
+            ? options.discountPercent
+            : 0;
+
+      return hasMappedValue ? nextRow : null;
+    })
+    .filter(Boolean);
+};
 
 const createEmptyCatalog = () => ({
   id: genId(),
@@ -65,6 +391,10 @@ const createEmptyCatalog = () => ({
   discountPercent: 10,
   hasLineItems: null,
   pastedData: "",
+  parsedData: [],
+  headerRowCount: 1,
+  columnMappings: [],
+  selectedTemplateId: "",
   headers: [],
   rows: [],
   mapping: defaultMapping(),
@@ -75,6 +405,10 @@ const createEmptyDirectImport = () => ({
   hasStandardDiscount: null,
   discountPercent: 10,
   pastedData: "",
+  parsedData: [],
+  headerRowCount: 1,
+  columnMappings: [],
+  selectedTemplateId: "",
   headers: [],
   rows: [],
   mapping: defaultMapping(),
@@ -107,6 +441,28 @@ const parseCurrency = (val) => {
   if (!val) return 0;
   const parsed = parseFloat(val.toString().replace(/[^0-9.-]+/g, ""));
   return Number.isNaN(parsed) ? 0 : parsed;
+};
+
+const calculateDiscountedPrice = (msrp, discountPercent) => {
+  if (!msrp) return "";
+
+  const msrpString = msrp.toString();
+  if (msrpString.toLowerCase().includes("all") || msrpString.toLowerCase().includes("see ")) {
+    return "N/A";
+  }
+
+  const msrpValue = parseCurrency(msrpString);
+  const discountValue = parseCurrency(discountPercent?.toString() || "0");
+
+  if (msrpValue === 0 && msrpString.trim() !== "0" && msrpString.trim() !== "$0") {
+    return "N/A";
+  }
+
+  const finalPrice = msrpValue * (1 - discountValue / 100);
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+  }).format(finalPrice);
 };
 
 const YesNoToggle = ({ value, onChange }) => (
@@ -176,6 +532,491 @@ const StepIndicator = ({ currentStep }) => {
   );
 };
 
+const ContractPreviewTable = ({ rows, emptyMessage, title }) => {
+  const visibleRows = rows.slice(0, CONTRACT_IMPORT_PREVIEW_ROW_LIMIT);
+
+  return (
+    <div className="mt-5 rounded-xl border border-[#0e3f4e]/20 bg-white p-5 shadow-sm">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h4 className="flex items-center font-semibold text-[#0e3f4e]">
+            <CheckCircle2 size={18} className="mr-2 text-[#7eb03e]" />
+            {title}
+          </h4>
+          <p className="mt-1 text-sm text-gray-600">
+            {rows.length === 0
+              ? emptyMessage
+              : `Showing ${visibleRows.length} of ${rows.length} mapped row${rows.length === 1 ? "" : "s"}.`}
+          </p>
+        </div>
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="mt-4 rounded-lg border border-dashed border-gray-300 bg-gray-50 px-4 py-6 text-sm text-gray-500">
+          {emptyMessage}
+        </div>
+      ) : (
+        <div className="mt-4 overflow-hidden rounded-lg border border-gray-200">
+          <div className="overflow-x-auto">
+            <table className="min-w-[1500px] w-full text-left text-xs">
+              <colgroup>
+                <col className="w-[170px]" />
+                <col className="w-[180px]" />
+                <col className="w-[270px]" />
+                <col className="w-[140px]" />
+                <col className="w-[320px]" />
+                <col className="w-[110px]" />
+                <col className="w-[160px]" />
+                <col className="w-[120px]" />
+                <col className="w-[130px]" />
+              </colgroup>
+              <thead className="bg-gray-50 text-gray-600">
+                <tr className="border-b border-gray-200 uppercase tracking-wider">
+                  <th className="px-4 py-3 font-semibold whitespace-nowrap">Manufacturer</th>
+                  <th className="px-4 py-3 font-semibold whitespace-nowrap">Website</th>
+                  <th className="px-4 py-3 font-semibold">Product Name</th>
+                  <th className="px-4 py-3 font-semibold whitespace-nowrap">Product #</th>
+                  <th className="px-4 py-3 font-semibold">Description</th>
+                  <th className="px-4 py-3 font-semibold whitespace-nowrap">Units</th>
+                  <th className="px-4 py-3 font-semibold whitespace-nowrap">MSRP</th>
+                  <th className="px-4 py-3 font-semibold whitespace-nowrap">Discount %</th>
+                  <th className="px-4 py-3 font-semibold whitespace-nowrap text-[#0e3f4e]">Net</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-200">
+                {visibleRows.map((row) => (
+                  <tr key={row.id} className="align-top">
+                    <td className="px-4 py-3 text-gray-700">{row.manufacturer || "—"}</td>
+                    <td className="px-4 py-3 text-gray-700">{row.website || "—"}</td>
+                    <td className="px-4 py-3 font-medium text-gray-900">{row.productName || "—"}</td>
+                    <td className="px-4 py-3 text-gray-700">{row.productNumber || "—"}</td>
+                    <td className="px-4 py-3 text-gray-700">{row.description || "—"}</td>
+                    <td className="px-4 py-3 text-gray-700">{row.units || "—"}</td>
+                    <td className="px-4 py-3 text-gray-700">{row.msrp || "—"}</td>
+                    <td className="px-4 py-3 text-right text-gray-700">{row.discount ?? 0}</td>
+                    <td className="px-4 py-3 text-right font-semibold text-[#0e3f4e]">
+                      {calculateDiscountedPrice(row.msrp, row.discount) || "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+function ContractImportConfigurator({
+  source,
+  onChange,
+  templates,
+  setTemplates,
+  previewManufacturer,
+  previewWebsite,
+  hasStandardDiscount,
+  discountPercent,
+  emptyPreviewMessage,
+}) {
+  const [templateName, setTemplateName] = useState("");
+  const normalizedSource = useMemo(() => normalizeContractImportSource(source), [source]);
+  const parsedPreviewRows = useMemo(
+    () =>
+      normalizedSource.parsedData.slice(
+        0,
+        Math.max(CONTRACT_IMPORT_PREVIEW_ROW_LIMIT, normalizedSource.headerRowCount + 3),
+      ),
+    [normalizedSource],
+  );
+  const previewRows = useMemo(
+    () =>
+      buildContractRowsFromImportSource(normalizedSource, {
+        manufacturer: previewManufacturer,
+        website: previewWebsite,
+        hasStandardDiscount,
+        discountPercent,
+      }),
+    [
+      normalizedSource,
+      previewManufacturer,
+      previewWebsite,
+      hasStandardDiscount,
+      discountPercent,
+    ],
+  );
+  const hasMappedColumns = normalizedSource.columnMappings.some(
+    (mapping) => !contractImportMappingIsIgnored(mapping),
+  );
+
+  const commitSource = (updates) => {
+    onChange(
+      normalizeContractImportSource({
+        ...normalizedSource,
+        ...updates,
+      }),
+    );
+  };
+
+  const handlePasteChange = (text) => {
+    const parsedData = parseSpreadsheetText(text);
+    const nextHeaderRowCount =
+      parsedData.length > 1
+        ? Math.min(Math.max(normalizedSource.headerRowCount || 1, 1), parsedData.length - 1)
+        : 0;
+
+    commitSource({
+      pastedData: text,
+      parsedData,
+      headerRowCount: nextHeaderRowCount,
+      columnMappings: createAutoMappedContractImportColumnMappings(parsedData, nextHeaderRowCount),
+      selectedTemplateId: "",
+    });
+  };
+
+  const handleHeaderRowCountChange = (value) => {
+    const maxHeaderRows = Math.max(0, normalizedSource.parsedData.length - 1);
+    const nextHeaderRowCount = Math.min(Math.max(value, 0), maxHeaderRows);
+    commitSource({
+      headerRowCount: nextHeaderRowCount,
+      selectedTemplateId: "",
+    });
+  };
+
+  const updateColumnMapping = (index, updates) => {
+    const nextMappings = [...normalizedSource.columnMappings];
+    nextMappings[index] = {
+      ...normalizeContractImportColumnMapping(nextMappings[index]),
+      ...updates,
+    };
+
+    commitSource({
+      columnMappings: nextMappings,
+      selectedTemplateId: "",
+    });
+  };
+
+  const toggleMappingType = (index, fieldKey) => {
+    const currentMapping = normalizeContractImportColumnMapping(normalizedSource.columnMappings[index]);
+    const currentTypes = normalizeContractImportMappingTypes(currentMapping);
+    const nextTypes = currentTypes.includes(fieldKey)
+      ? currentTypes.filter((type) => type !== fieldKey)
+      : [...currentTypes, fieldKey];
+
+    updateColumnMapping(index, {
+      ...createContractImportColumnMappingState(nextTypes),
+    });
+  };
+
+  const addFixedColumn = () => {
+    commitSource({
+      columnMappings: [
+        ...normalizedSource.columnMappings,
+        {
+          ...createEmptyContractImportColumnMapping(),
+          isFixed: true,
+          customName: `Fixed Column ${normalizedSource.columnMappings.length + 1}`,
+        },
+      ],
+      selectedTemplateId: "",
+    });
+  };
+
+  const applyTemplateById = (templateId) => {
+    const template = templates.find((currentTemplate) => currentTemplate.id === templateId);
+    if (!template) {
+      commitSource({ selectedTemplateId: "" });
+      return;
+    }
+
+    const parsedColumnCount = getParsedColumnCount(normalizedSource.parsedData);
+    const nextMappings = Array.from(
+      { length: Math.max(parsedColumnCount, template.mappings.length) },
+      (_, index) =>
+        index < template.mappings.length
+          ? normalizeContractImportColumnMapping(template.mappings[index])
+          : createEmptyContractImportColumnMapping(),
+    );
+    const maxHeaderRows = Math.max(0, normalizedSource.parsedData.length - 1);
+    const requestedHeaderRows =
+      typeof template.headerRowCount === "number"
+        ? template.headerRowCount
+        : normalizedSource.headerRowCount;
+
+    commitSource({
+      columnMappings: nextMappings,
+      headerRowCount: Math.min(Math.max(requestedHeaderRows, 0), maxHeaderRows),
+      selectedTemplateId: template.id,
+    });
+  };
+
+  const handleSaveTemplate = () => {
+    const trimmedName = templateName.trim();
+    if (!trimmedName) {
+      return;
+    }
+
+    const existingTemplate = templates.find(
+      (template) => template.name.toLowerCase() === trimmedName.toLowerCase(),
+    );
+    const nextTemplate = {
+      id: existingTemplate?.id || genId(),
+      name: trimmedName,
+      headerRowCount: normalizedSource.headerRowCount,
+      mappings: normalizedSource.columnMappings.map((mapping) => ({
+        ...createContractImportColumnMappingState(mapping),
+        isFixed: mapping.isFixed === true,
+        fixedValue: mapping.fixedValue || "",
+        customName: mapping.customName || "",
+      })),
+    };
+
+    setTemplates((currentTemplates) => {
+      if (existingTemplate) {
+        return currentTemplates.map((template) =>
+          template.id === existingTemplate.id ? nextTemplate : template,
+        );
+      }
+
+      return [...currentTemplates, nextTemplate];
+    });
+
+    commitSource({ selectedTemplateId: nextTemplate.id });
+    setTemplateName("");
+  };
+
+  return (
+    <div className="mt-6 space-y-5">
+      <div className="rounded-xl border border-[#0e3f4e]/20 bg-[#0e3f4e]/5 p-5">
+        <label className="block text-sm font-semibold text-gray-800 mb-2">
+          Paste line by line info from your spreadsheet below:
+        </label>
+        <textarea
+          rows={8}
+          value={normalizedSource.pastedData}
+          onChange={(event) => handlePasteChange(event.target.value)}
+          placeholder="Copy from Excel or Google Sheets and paste here..."
+          className="w-full rounded-lg border border-gray-300 bg-white p-4 font-mono text-sm outline-none transition-shadow focus:ring-2 focus:ring-[#0e3f4e]"
+        />
+      </div>
+
+      {(normalizedSource.parsedData.length > 0 || normalizedSource.columnMappings.length > 0) && (
+        <>
+          <div className="rounded-xl border border-[#0e3f4e]/20 bg-white p-5 shadow-sm">
+            <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+              <div>
+                <h4 className="flex items-center font-semibold text-[#0e3f4e]">
+                  <Save size={18} className="mr-2 text-[#7eb03e]" />
+                  Saved Map Templates
+                </h4>
+                <p className="mt-1 text-sm text-gray-600">
+                  Save this mapping layout and reuse it across future catalog imports.
+                </p>
+              </div>
+
+              <div className="flex w-full flex-col gap-3 lg:flex-row">
+                <select
+                  value={normalizedSource.selectedTemplateId || ""}
+                  onChange={(event) => applyTemplateById(event.target.value)}
+                  disabled={templates.length === 0}
+                  className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm focus:border-[#0e3f4e] focus:outline-none focus:ring-2 focus:ring-[#0e3f4e] disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-400"
+                >
+                  <option value="">
+                    {templates.length === 0 ? "No saved templates yet" : "Select saved template..."}
+                  </option>
+                  {templates.map((template) => (
+                    <option key={template.id} value={template.id}>
+                      {template.name}
+                    </option>
+                  ))}
+                </select>
+
+                <input
+                  type="text"
+                  value={templateName}
+                  onChange={(event) => setTemplateName(event.target.value)}
+                  placeholder="Template name"
+                  className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm focus:border-[#0e3f4e] focus:outline-none focus:ring-2 focus:ring-[#0e3f4e]"
+                />
+
+                <button
+                  type="button"
+                  onClick={handleSaveTemplate}
+                  disabled={!hasMappedColumns}
+                  className="inline-flex shrink-0 items-center justify-center rounded-lg bg-[#0e3f4e] px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[#0e3f4e]/90 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Save size={16} className="mr-2" />
+                  Save Template
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <label className="block text-sm font-semibold text-gray-800">Map columns to contract fields</label>
+            <div className="flex flex-wrap items-center gap-4">
+              <button
+                type="button"
+                onClick={addFixedColumn}
+                className="inline-flex items-center rounded-lg bg-emerald-50 px-3 py-1.5 text-sm font-medium text-emerald-700 transition-colors hover:bg-emerald-100"
+              >
+                <Plus size={16} className="mr-1.5" />
+                Add Fixed Column
+              </button>
+              <div className="flex items-center gap-3 border-l border-gray-200 pl-4 text-sm font-medium text-gray-600">
+                <label htmlFor={`header-rows-${normalizedSource.selectedTemplateId || "import"}`}>
+                  Header Rows:
+                </label>
+                <input
+                  id={`header-rows-${normalizedSource.selectedTemplateId || "import"}`}
+                  type="number"
+                  min="0"
+                  max={Math.max(0, normalizedSource.parsedData.length - 1)}
+                  value={normalizedSource.headerRowCount}
+                  onChange={(event) =>
+                    handleHeaderRowCountChange(Number.parseInt(event.target.value, 10) || 0)
+                  }
+                  className="w-16 rounded border border-gray-300 px-2 py-1 text-center focus:outline-none focus:ring-1 focus:ring-[#0e3f4e]"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="overflow-hidden rounded-xl border border-gray-200 shadow-sm">
+            <table className="w-full table-fixed text-left text-sm">
+              <thead className="border-b border-gray-200 bg-gray-50">
+                <tr>
+                  {normalizedSource.columnMappings.map((mapping, columnIndex) => {
+                    const selectedTypes = normalizeContractImportMappingTypes(mapping);
+                    const displayLabel = mapping.isFixed
+                      ? mapping.customName || `Fixed Column ${columnIndex + 1}`
+                      : getCombinedHeaderFromRows(
+                          normalizedSource.parsedData,
+                          normalizedSource.headerRowCount,
+                          columnIndex,
+                        );
+
+                    return (
+                      <th
+                        key={`mapping-${columnIndex}`}
+                        className="w-auto max-w-0 border-r border-gray-200 p-3 align-top font-normal last:border-r-0"
+                      >
+                        <div className="flex min-w-0 flex-col gap-2">
+                          <div
+                            className={`rounded-lg border p-2 ${
+                              selectedTypes.length === 0
+                                ? "border-gray-300 bg-white"
+                                : "border-emerald-300 bg-emerald-50/70"
+                            }`}
+                          >
+                            <div className="mb-2">
+                              <div className="text-[11px] font-semibold uppercase tracking-wide text-gray-500">
+                                Source Column
+                              </div>
+                              <div className="mt-1 break-words text-xs font-semibold text-gray-800">
+                                {displayLabel}
+                              </div>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-1.5">
+                              {ESTIMATOR_MAPPING_FIELDS.map((field) => {
+                                const isChecked = contractImportMappingHasType(mapping, field.key);
+
+                                return (
+                                  <label
+                                    key={field.key}
+                                    className={`flex cursor-pointer items-center gap-1.5 rounded-md border px-2 py-1 ${
+                                      isChecked
+                                        ? "border-emerald-300 bg-white text-emerald-900"
+                                        : "border-gray-200 bg-white/80 text-gray-600 hover:border-gray-300"
+                                    }`}
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={isChecked}
+                                      onChange={() => toggleMappingType(columnIndex, field.key)}
+                                      className="rounded border-emerald-300 text-emerald-600 focus:ring-emerald-500"
+                                    />
+                                    <span className="min-w-0 break-words text-[11px] leading-4">
+                                      {field.label}
+                                    </span>
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          {mapping.isFixed && (
+                            <>
+                              <input
+                                type="text"
+                                value={mapping.customName}
+                                onChange={(event) =>
+                                  updateColumnMapping(columnIndex, { customName: event.target.value })
+                                }
+                                placeholder="Fixed column label"
+                                className="w-full rounded-lg border border-gray-300 bg-white px-2 py-1.5 text-xs focus:border-[#0e3f4e] focus:outline-none focus:ring-1 focus:ring-[#0e3f4e]"
+                              />
+                              <input
+                                type="text"
+                                value={mapping.fixedValue}
+                                onChange={(event) =>
+                                  updateColumnMapping(columnIndex, { fixedValue: event.target.value })
+                                }
+                                placeholder="Value for all rows"
+                                className="w-full rounded-lg border border-emerald-300 bg-emerald-50 px-2 py-1.5 text-xs font-medium text-emerald-900 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                              />
+                            </>
+                          )}
+                        </div>
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {parsedPreviewRows.map((row, rowIndex) => (
+                  <tr
+                    key={`row-${rowIndex}`}
+                    className={
+                      rowIndex < normalizedSource.headerRowCount
+                        ? "bg-gray-100/70 italic text-gray-400"
+                        : "hover:bg-gray-50"
+                    }
+                  >
+                    {normalizedSource.columnMappings.map((mapping, columnIndex) => (
+                      <td
+                        key={`cell-${rowIndex}-${columnIndex}`}
+                        className="max-w-0 whitespace-normal break-words border-r border-gray-100 p-3 align-top text-xs last:border-r-0"
+                      >
+                        {mapping.isFixed ? (
+                          <span className="font-medium text-emerald-700">{mapping.fixedValue || "—"}</span>
+                        ) : (
+                          row[columnIndex] || ""
+                        )}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <ContractPreviewTable
+            rows={previewRows}
+            emptyMessage={
+              hasMappedColumns
+                ? emptyPreviewMessage
+                : "Choose at least one destination field to preview the resulting contract rows."
+            }
+            title="Preview of Resulting Contract Rows"
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
 const StatusBadge = ({ status }) => {
   const styles = {
     Draft: "bg-gray-100 text-gray-700 border border-gray-200",
@@ -218,6 +1059,11 @@ export default function App() {
   const [selectedEstimatorGroupIds, setSelectedEstimatorGroupIds] = useState([]);
   const [estimatorPricingMode, setEstimatorPricingMode] = useState(null);
   const [estimatorImportMapping, setEstimatorImportMapping] = useState(null);
+  const [estimatorImportManufacturer, setEstimatorImportManufacturer] = useState("");
+  const [estimatorImportWebsite, setEstimatorImportWebsite] = useState("");
+  const [contractImportTemplates, setContractImportTemplates] = useState(() =>
+    normalizeStoredContractImportTemplates(readJsonStorage(CONTRACT_IMPORT_TEMPLATES_STORAGE_KEY, [])),
+  );
   const [tableData, setTableData] = useState([]);
   const [annotations, setAnnotations] = useState({ global: "", rows: {} });
 
@@ -228,6 +1074,10 @@ export default function App() {
   useEffect(() => {
     writeJsonStorage(VIEW_MODE_KEY, viewMode);
   }, [viewMode]);
+
+  useEffect(() => {
+    writeJsonStorage(CONTRACT_IMPORT_TEMPLATES_STORAGE_KEY, contractImportTemplates);
+  }, [contractImportTemplates]);
 
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
@@ -322,13 +1172,15 @@ export default function App() {
 
     const nextMapping = {};
 
-    ESTIMATOR_MAPPING_FIELDS.forEach(({ key }) => {
+    ESTIMATOR_BOOK_IMPORT_MAPPING_FIELDS.forEach(({ key, allowFixed }) => {
       const validOptionIds = new Set(config.fieldOptions[key].map((option) => option.id));
       const currentValue = currentMapping?.[key];
+      const isValidFixedValue = allowFixed && currentValue === getEstimatorImportFixedSourceId(key);
 
       if (
         currentValue === ESTIMATOR_IMPORT_IGNORE_SOURCE_ID ||
-        validOptionIds.has(currentValue)
+        validOptionIds.has(currentValue) ||
+        isValidFixedValue
       ) {
         nextMapping[key] = currentValue;
         return;
@@ -373,6 +1225,8 @@ export default function App() {
       setSelectedEstimatorGroupIds([]);
       setEstimatorPricingMode(null);
       setEstimatorImportMapping(null);
+      setEstimatorImportManufacturer("");
+      setEstimatorImportWebsite("");
       return;
     }
 
@@ -485,6 +1339,8 @@ export default function App() {
     setSelectedEstimatorGroupIds([]);
     setEstimatorPricingMode(null);
     setEstimatorImportMapping(null);
+    setEstimatorImportManufacturer("");
+    setEstimatorImportWebsite("");
     setTableData([]);
     setAnnotations({ global: "", rows: {} });
     setStep(0);
@@ -515,6 +1371,8 @@ export default function App() {
       selectedEstimatorGroupIds,
       estimatorPricingMode,
       estimatorImportMapping,
+      estimatorImportManufacturer,
+      estimatorImportWebsite,
       status,
       annotations,
     };
@@ -539,8 +1397,10 @@ export default function App() {
     setTableData(cloneData(module.data || []));
 
     if (module.usingThirdParty !== undefined) setUsingThirdParty(module.usingThirdParty);
-    if (module.catalogs) setCatalogs(cloneData(module.catalogs));
-    if (module.directImport) setDirectImport(cloneData(module.directImport));
+    if (module.catalogs) {
+      setCatalogs(cloneData(module.catalogs).map((catalog) => normalizeContractImportSource(catalog)));
+    }
+    if (module.directImport) setDirectImport(normalizeContractImportSource(cloneData(module.directImport)));
     setUseExistingBook(module.useExistingBook ?? null);
     setSelectedEstimatorBookId(module.selectedEstimatorBookId ?? null);
     setSelectedEstimatorBookSnapshot(
@@ -554,6 +1414,8 @@ export default function App() {
     );
     setEstimatorPricingMode(module.estimatorPricingMode ?? null);
     setEstimatorImportMapping(module.estimatorImportMapping ? cloneData(module.estimatorImportMapping) : null);
+    setEstimatorImportManufacturer(module.estimatorImportManufacturer ?? "");
+    setEstimatorImportWebsite(module.estimatorImportWebsite ?? "");
 
     setAnnotations(cloneData(module.annotations || { global: "", rows: {} }));
     setConfirmingSubmit(action === "confirm");
@@ -574,101 +1436,19 @@ export default function App() {
     );
   };
 
-  const autoMapHeaders = (headers) => ({
-    productName: headers.findIndex(
-      (header) =>
-        header.toLowerCase().includes("name") || header.toLowerCase().includes("item"),
-    ),
-    productNumber: headers.findIndex(
-      (header) =>
-        header.toLowerCase().includes("#") ||
-        header.toLowerCase().includes("num") ||
-        header.toLowerCase().includes("sku"),
-    ),
-    description: headers.findIndex((header) => header.toLowerCase().includes("desc")),
-    units: headers.findIndex(
-      (header) =>
-        header.toLowerCase().includes("unit") || header.toLowerCase().includes("uom"),
-    ),
-    msrp: headers.findIndex(
-      (header) =>
-        header.toLowerCase().includes("msrp") ||
-        header.toLowerCase().includes("price") ||
-        header.toLowerCase().includes("cost"),
-    ),
-    discount: headers.findIndex(
-      (header) =>
-        header.toLowerCase().includes("disc") || header.toLowerCase().includes("%"),
-    ),
-  });
-
-  const handlePasteData = (catalogId, text) => {
-    const lines = text.trim().split("\n");
-
-    if (lines.length < 2) {
-      updateCatalog(catalogId, "pastedData", text);
-      return;
-    }
-
-    const headers = lines[0].split("\t").map((header) => header.trim());
-    const rows = lines
-      .slice(1)
-      .map((line) => line.split("\t").map((cell) => cell.trim()))
-      .filter((row) => row.some(Boolean));
-    const mapping = autoMapHeaders(headers);
-
+  const updateCatalogImportSource = (catalogId, nextSource) => {
     setCatalogs((prev) =>
       prev.map((catalog) =>
-        catalog.id === catalogId ? { ...catalog, pastedData: text, headers, rows, mapping } : catalog,
+        catalog.id === catalogId ? { ...catalog, ...normalizeContractImportSource(nextSource) } : catalog,
       ),
     );
   };
 
-  const handleDirectPasteData = (text) => {
-    const lines = text.trim().split("\n");
-
-    if (lines.length < 2) {
-      setDirectImport((prev) => ({ ...prev, pastedData: text }));
-      return;
-    }
-
-    const headers = lines[0].split("\t").map((header) => header.trim());
-    const rows = lines
-      .slice(1)
-      .map((line) => line.split("\t").map((cell) => cell.trim()))
-      .filter((row) => row.some(Boolean));
-    const mapping = autoMapHeaders(headers);
-
-    setDirectImport((prev) => ({ ...prev, pastedData: text, headers, rows, mapping }));
-  };
-
-  const updateMapping = (catalogId, field, index) => {
-    setCatalogs((prev) =>
-      prev.map((catalog) =>
-        catalog.id === catalogId
-          ? { ...catalog, mapping: { ...catalog.mapping, [field]: index } }
-          : catalog,
-      ),
-    );
-  };
-
-  const updateDirectMapping = (field, index) => {
+  const updateDirectImportSource = (nextSource) => {
     setDirectImport((prev) => ({
       ...prev,
-      mapping: { ...prev.mapping, [field]: index },
+      ...normalizeContractImportSource(nextSource),
     }));
-  };
-
-  const getCalculatedDiscount = (row, mapping, hasStandard, standardPct) => {
-    if (mapping.discount !== -1 && row[mapping.discount]) {
-      const mappedValue = parseFloat(
-        row[mapping.discount].toString().replace(/[^0-9.-]+/g, ""),
-      );
-
-      if (!Number.isNaN(mappedValue)) return mappedValue;
-    }
-
-    return hasStandard ? standardPct : 0;
   };
 
   const generateTable = () => {
@@ -681,33 +1461,25 @@ export default function App() {
           groupIds: selectedEstimatorGroupIds,
           mapping: estimatorImportMapping,
           pricingMode: estimatorPricingMode,
+          manufacturer: estimatorImportManufacturer,
+          website: estimatorImportWebsite,
         }),
       );
     }
 
     if (usingThirdParty) {
       catalogs.forEach((catalog) => {
-        if (catalog.hasLineItems && catalog.rows.length > 0) {
-          catalog.rows.forEach((row) => {
-            const getValue = (index) => (index !== -1 && row[index] ? row[index] : "");
+        const normalizedCatalog = normalizeContractImportSource(catalog);
 
-            newTable.push({
-              id: genId(),
+        if (catalog.hasLineItems && normalizedCatalog.rows.length > 0) {
+          newTable.push(
+            ...buildContractRowsFromImportSource(normalizedCatalog, {
               manufacturer: catalog.manufacturer,
               website: catalog.link,
-              productName: getValue(catalog.mapping.productName),
-              productNumber: getValue(catalog.mapping.productNumber),
-              description: getValue(catalog.mapping.description),
-              units: getValue(catalog.mapping.units),
-              msrp: getValue(catalog.mapping.msrp),
-              discount: getCalculatedDiscount(
-                row,
-                catalog.mapping,
-                catalog.hasStandardDiscount,
-                catalog.discountPercent,
-              ),
-            });
-          });
+              hasStandardDiscount: catalog.hasStandardDiscount,
+              discountPercent: catalog.discountPercent,
+            }),
+          );
         } else if (catalog.manufacturer) {
           newTable.push({
             id: genId(),
@@ -724,27 +1496,15 @@ export default function App() {
       });
     }
 
-    if (directImport.hasLineItems && directImport.rows.length > 0) {
-      directImport.rows.forEach((row) => {
-        const getValue = (index) => (index !== -1 && row[index] ? row[index] : "");
-
-        newTable.push({
-          id: genId(),
+    if (directImport.hasLineItems && normalizeContractImportSource(directImport).rows.length > 0) {
+      newTable.push(
+        ...buildContractRowsFromImportSource(directImport, {
           manufacturer: vendorName,
           website: "",
-          productName: getValue(directImport.mapping.productName),
-          productNumber: getValue(directImport.mapping.productNumber),
-          description: getValue(directImport.mapping.description),
-          units: getValue(directImport.mapping.units),
-          msrp: getValue(directImport.mapping.msrp),
-          discount: getCalculatedDiscount(
-            row,
-            directImport.mapping,
-            directImport.hasStandardDiscount,
-            directImport.discountPercent,
-          ),
-        });
-      });
+          hasStandardDiscount: directImport.hasStandardDiscount,
+          discountPercent: directImport.discountPercent,
+        }),
+      );
     }
 
     if (newTable.length === 0) {
@@ -1068,40 +1828,21 @@ export default function App() {
       hasSelectedEstimatorGroups &&
       (!requiresEstimatorPricingQuestion || Boolean(estimatorPricingMode)) &&
       Boolean(estimatorImportConfig);
+    const estimatorPreviewRows =
+      shouldShowEstimatorMapping && selectedEstimatorBook
+        ? buildPart1RowsFromEstimatorBook(selectedEstimatorBook, vendorName, {
+            groupIds: selectedEstimatorGroupIds,
+            mapping: estimatorImportMapping,
+            pricingMode: estimatorPricingMode,
+            manufacturer: estimatorImportManufacturer,
+            website: estimatorImportWebsite,
+          })
+        : [];
+    const normalizedDirectImport = normalizeContractImportSource(directImport);
     const catalogQuestionNumber = showExistingBookQuestion ? 5 : 4;
     const directImportQuestionNumber = showExistingBookQuestion ? 6 : 5;
 
-    const MapColumnsUI = ({ mapping, onMapChange }) => (
-      <div className="bg-white border border-[#0e3f4e]/20 rounded-xl p-5 shadow-sm mt-4">
-        <h4 className="font-semibold text-[#0e3f4e] mb-4 flex items-center">
-          <CheckCircle2 size={18} className="mr-2 text-[#7eb03e]" />
-          Map Your Columns
-        </h4>
-        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-          {ESTIMATOR_MAPPING_FIELDS.map((field) => (
-            <div key={field.key} className="flex flex-col">
-              <label className="mb-2 flex min-h-[3rem] items-end text-xs font-bold uppercase tracking-wider text-gray-600">
-                {field.label}
-              </label>
-              <select
-                value={mapping.selections[field.key]}
-                onChange={(event) => onMapChange(field.key, Number.parseInt(event.target.value, 10))}
-                className="w-full text-sm border-gray-300 rounded-md shadow-sm focus:border-[#0e3f4e] focus:ring-[#0e3f4e] py-2"
-              >
-                <option value="-1">-- Ignore --</option>
-                {mapping.headers.map((header, index) => (
-                  <option key={index} value={index}>
-                    {header || `Column ${index + 1}`}
-                  </option>
-                ))}
-              </select>
-            </div>
-          ))}
-        </div>
-      </div>
-    );
-
-    const EstimatorColumnsUI = ({ config, mapping, onMapChange }) => (
+    const renderEstimatorColumnsUI = ({ config, mapping, onMapChange, previewRows }) => (
       <div className="mt-5 rounded-xl border border-[#0e3f4e]/20 bg-white p-5 shadow-sm">
         <h4 className="font-semibold text-[#0e3f4e] mb-2 flex items-center">
           <CheckCircle2 size={18} className="mr-2 text-[#7eb03e]" />
@@ -1132,10 +1873,72 @@ export default function App() {
             </div>
           ))}
         </div>
+
+        <div className="mt-5 rounded-xl border border-dashed border-[#0e3f4e]/20 bg-[#0e3f4e]/[0.03] p-4">
+          <div className="mb-3">
+            <div className="text-sm font-semibold text-[#0e3f4e]">Optional Contract Fields</div>
+            <p className="mt-1 text-sm text-gray-600">
+              These do not change your custom book schema. Use them only if you want Manufacturer or
+              Website to come from a mapped info field, or from one shared value for every imported
+              row.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {ESTIMATOR_BOOK_OPTIONAL_FIELDS.map((field) => (
+              <div key={field.key} className="flex flex-col">
+                <label className="mb-2 flex min-h-[3rem] items-end text-xs font-bold uppercase tracking-wider text-gray-600">
+                  {field.label}
+                </label>
+                <select
+                  value={mapping?.[field.key] ?? ESTIMATOR_IMPORT_IGNORE_SOURCE_ID}
+                  onChange={(event) => onMapChange(field.key, event.target.value)}
+                  className="w-full text-sm border-gray-300 rounded-md shadow-sm focus:border-[#0e3f4e] focus:ring-[#0e3f4e] py-2"
+                >
+                  <option value={ESTIMATOR_IMPORT_IGNORE_SOURCE_ID}>-- Leave Blank --</option>
+                  <option value={getEstimatorImportFixedSourceId(field.key)}>
+                    Use one value for all rows
+                  </option>
+                  {config.fieldOptions[field.key].map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.optionLabel}
+                    </option>
+                  ))}
+                </select>
+                {field.key === "manufacturer" &&
+                  mapping?.[field.key] === getEstimatorImportFixedSourceId(field.key) && (
+                    <input
+                      type="text"
+                      value={estimatorImportManufacturer}
+                      onChange={(event) => setEstimatorImportManufacturer(event.target.value)}
+                      placeholder="Manufacturer for all imported rows"
+                      className="mt-2 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-[#0e3f4e] focus:outline-none focus:ring-2 focus:ring-[#0e3f4e]"
+                    />
+                  )}
+                {field.key === "website" &&
+                  mapping?.[field.key] === getEstimatorImportFixedSourceId(field.key) && (
+                    <input
+                      type="url"
+                      value={estimatorImportWebsite}
+                      onChange={(event) => setEstimatorImportWebsite(event.target.value)}
+                      placeholder="Website for all imported rows"
+                      className="mt-2 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-[#0e3f4e] focus:outline-none focus:ring-2 focus:ring-[#0e3f4e]"
+                    />
+                  )}
+              </div>
+            ))}
+          </div>
+        </div>
+
         <p className="mt-4 text-xs text-gray-500">
           Tip: choose a specific amount source such as `Amount: Price/Ctn` for MSRP and a matching
           estimator discount source for `% Discount` when your book stores multiple price fields.
         </p>
+
+        <ContractPreviewTable
+          rows={previewRows}
+          emptyMessage="Choose a saved book and mapped fields to preview the contract rows this import will create."
+          title="Preview of Imported Book Rows"
+        />
       </div>
     );
 
@@ -1148,7 +1951,7 @@ export default function App() {
       (!shouldShowEstimatorMapping || Boolean(estimatorImportMapping));
 
     return (
-      <div className="max-w-5xl mx-auto animate-in slide-in-from-right-8 fade-in duration-300">
+      <div className="mx-auto w-[min(96vw,1800px)] animate-in slide-in-from-right-8 fade-in duration-300">
         <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-8 mb-6">
           <div className="flex items-center mb-6 text-[#0e3f4e]">
             <LayoutList className="mr-3" size={28} />
@@ -1368,11 +2171,12 @@ export default function App() {
                   )}
 
                   {shouldShowEstimatorMapping && estimatorImportConfig && estimatorImportMapping && (
-                    <EstimatorColumnsUI
-                      config={estimatorImportConfig}
-                      mapping={estimatorImportMapping}
-                      onMapChange={handleEstimatorImportMappingChange}
-                    />
+                    renderEstimatorColumnsUI({
+                      config: estimatorImportConfig,
+                      mapping: estimatorImportMapping,
+                      onMapChange: handleEstimatorImportMappingChange,
+                      previewRows: estimatorPreviewRows,
+                    })
                   )}
                 </div>
               )}
@@ -1494,23 +2298,17 @@ export default function App() {
 
                     {catalog.hasLineItems && (
                       <div className="mt-6 animate-in fade-in slide-in-from-top-4 duration-300">
-                        <label className="block text-sm font-semibold text-gray-700 mb-2">
-                          Paste info from your spreadsheet below:
-                        </label>
-                        <textarea
-                          rows={6}
-                          value={catalog.pastedData}
-                          onChange={(event) => handlePasteData(catalog.id, event.target.value)}
-                          placeholder="Copy from Excel and paste here..."
-                          className="w-full p-4 font-mono text-sm bg-gray-50 rounded-lg border border-gray-300 focus:ring-2 focus:ring-[#0e3f4e] focus:bg-white outline-none whitespace-pre overflow-x-auto shadow-inner mb-4"
+                        <ContractImportConfigurator
+                          source={normalizeContractImportSource(catalog)}
+                          onChange={(nextSource) => updateCatalogImportSource(catalog.id, nextSource)}
+                          templates={contractImportTemplates}
+                          setTemplates={setContractImportTemplates}
+                          previewManufacturer={catalog.manufacturer}
+                          previewWebsite={catalog.link}
+                          hasStandardDiscount={catalog.hasStandardDiscount}
+                          discountPercent={catalog.discountPercent}
+                          emptyPreviewMessage="Map at least one catalog column to preview how these rows will land in the Part 1 table."
                         />
-
-                        {catalog.headers.length > 0 && (
-                          MapColumnsUI({
-                            mapping: { headers: catalog.headers, selections: catalog.mapping },
-                            onMapChange: (field, index) => updateMapping(catalog.id, field, index),
-                          })
-                        )}
                       </div>
                     )}
                   </div>
@@ -1597,26 +2395,17 @@ export default function App() {
                   </div>
                 </div>
 
-                <label className="block text-sm font-semibold text-gray-700 mb-2">
-                  Paste line by line info from your spreadsheet below:
-                </label>
-                <textarea
-                  rows={8}
-                  value={directImport.pastedData}
-                  onChange={(event) => handleDirectPasteData(event.target.value)}
-                  placeholder="Copy from Excel and paste here..."
-                  className="w-full p-4 font-mono text-sm bg-gray-50 rounded-lg border border-gray-300 focus:ring-2 focus:ring-[#0e3f4e] focus:bg-white outline-none whitespace-pre overflow-x-auto shadow-inner mb-4"
+                <ContractImportConfigurator
+                  source={normalizedDirectImport}
+                  onChange={updateDirectImportSource}
+                  templates={contractImportTemplates}
+                  setTemplates={setContractImportTemplates}
+                  previewManufacturer={vendorName}
+                  previewWebsite=""
+                  hasStandardDiscount={directImport.hasStandardDiscount}
+                  discountPercent={directImport.discountPercent}
+                  emptyPreviewMessage="Map at least one imported column to preview the contract rows that will be created."
                 />
-
-                {directImport.headers.length > 0 && (
-                  MapColumnsUI({
-                    mapping: {
-                      headers: directImport.headers,
-                      selections: directImport.mapping,
-                    },
-                    onMapChange: updateDirectMapping,
-                  })
-                )}
               </div>
             )}
           </div>

@@ -42,6 +42,34 @@ export const ESTIMATOR_BOOKS_STORAGE_KEY = "part1module:estimator-books:v1";
 const ESTIMATOR_ACTIVE_BOOK_STORAGE_KEY = "part1module:estimator-active-book:v1";
 const ESTIMATOR_COLUMNS_STORAGE_KEY = "part1module:estimator-columns:v1";
 const ESTIMATOR_IMPORT_TEMPLATES_STORAGE_KEY = "part1module:estimator-import-templates:v1";
+const ESTIMATOR_IMPORT_STANDARD_MAPPING_OPTIONS = [
+  { id: "itemNumber", label: "Item #" },
+  { id: "itemName", label: "Item Name" },
+  { id: "description", label: "Description" },
+  { id: "uom", label: "UOM" },
+  { id: "material", label: "Material Cost" },
+  { id: "labor", label: "Labor Cost" },
+  { id: "equipment", label: "Equipment Cost" },
+  { id: "total", label: "Final Total" },
+];
+const ESTIMATOR_IMPORT_CUSTOM_MAPPING_OPTIONS = [
+  { id: "other_amount", label: "Create Amount" },
+  { id: "other_discount", label: "Create Discount %" },
+  { id: "other_info", label: "Create Info" },
+];
+const ESTIMATOR_IMPORT_VALID_MAPPING_TYPES = new Set(
+  [...ESTIMATOR_IMPORT_STANDARD_MAPPING_OPTIONS, ...ESTIMATOR_IMPORT_CUSTOM_MAPPING_OPTIONS].map(
+    (option) => option.id,
+  ),
+);
+const ESTIMATOR_IMPORT_CUSTOM_MAPPING_TYPES = new Set(
+  ESTIMATOR_IMPORT_CUSTOM_MAPPING_OPTIONS.map((option) => option.id),
+);
+const ESTIMATOR_IMPORT_MAPPING_TYPE_ORDER = new Map(
+  [...ESTIMATOR_IMPORT_STANDARD_MAPPING_OPTIONS, ...ESTIMATOR_IMPORT_CUSTOM_MAPPING_OPTIONS].map(
+    (option, index) => [option.id, index],
+  ),
+);
 const TABLE_COLUMN_DEFINITIONS = [
   { id: "itemNumber", label: "Item #", width: 150, align: "left" },
   { id: "itemName", label: "Item Name", width: 220, align: "left" },
@@ -100,6 +128,46 @@ const normalizeStoredImportTemplates = (storedTemplates) => {
       Array.isArray(template.mappings),
   );
 };
+
+const normalizeEstimatorImportMappingTypes = (value) => {
+  const rawTypes = Array.isArray(value)
+    ? value
+    : Array.isArray(value?.types)
+      ? value.types
+      : typeof value === "string"
+        ? [value]
+        : typeof value?.type === "string"
+          ? [value.type]
+          : [];
+
+  return Array.from(
+    new Set(rawTypes.filter((type) => ESTIMATOR_IMPORT_VALID_MAPPING_TYPES.has(type))),
+  ).sort(
+    (left, right) =>
+      (ESTIMATOR_IMPORT_MAPPING_TYPE_ORDER.get(left) ?? Number.MAX_SAFE_INTEGER) -
+      (ESTIMATOR_IMPORT_MAPPING_TYPE_ORDER.get(right) ?? Number.MAX_SAFE_INTEGER),
+  );
+};
+
+const createEstimatorImportMappingState = (value = []) => {
+  const types = normalizeEstimatorImportMappingTypes(value);
+
+  return {
+    type: types[0] ?? "ignore",
+    types,
+  };
+};
+
+const estimatorImportMappingHasType = (mapping, type) =>
+  normalizeEstimatorImportMappingTypes(mapping).includes(type);
+
+const estimatorImportMappingUsesCustomType = (mapping) =>
+  normalizeEstimatorImportMappingTypes(mapping).some((type) =>
+    ESTIMATOR_IMPORT_CUSTOM_MAPPING_TYPES.has(type),
+  );
+
+const estimatorImportMappingIsIgnored = (mapping) =>
+  normalizeEstimatorImportMappingTypes(mapping).length === 0;
 
 const normalizeStoredTableColumns = (storedColumns) => {
   const defaultColumns = createDefaultTableColumns();
@@ -547,7 +615,7 @@ const estimatorItemHasContractData = (group, item) => {
     return true;
   }
 
-  return item.pricingStatus !== "priced";
+  return false;
 };
 
 const toContractPercentValue = (value) => {
@@ -568,6 +636,7 @@ const getIncludedEstimatorGroupsForPart1Import = (book, groupIds) => {
 };
 
 export const ESTIMATOR_IMPORT_IGNORE_SOURCE_ID = "__ignore__";
+export const getEstimatorImportFixedSourceId = (fieldKey) => `__fixed__:${fieldKey}`;
 
 const getEstimatorImportSourceSlug = (value) => {
   const normalizedValue = normalizeTextValue(value)
@@ -766,9 +835,7 @@ const findRecommendedEstimatorDiscountSourceId = (contexts, percentOptions, pric
   }
 
   const percentOptionIds = new Set(percentOptions.map((option) => option.id));
-  const discountedContexts = contexts.filter(
-    ({ item, payload }) => item.pricingStatus === "priced" && payload.pricingMetrics.hasEstimatorDiscount,
-  );
+  const discountedContexts = contexts.filter(({ payload }) => payload.pricingMetrics.hasEstimatorDiscount);
 
   if (discountedContexts.length === 0) {
     return ESTIMATOR_IMPORT_IGNORE_SOURCE_ID;
@@ -840,11 +907,7 @@ const findRecommendedEstimatorMsrpSourceId = (
     const targetCounts = new Map();
     let contextsWithTargets = 0;
 
-    contexts.forEach(({ item, payload }) => {
-      if (item.pricingStatus !== "priced") {
-        return;
-      }
-
+    contexts.forEach(({ payload }) => {
       const matchingTargets = payload.discountTargetsBySourceId[discountSourceId];
       if (!matchingTargets || matchingTargets.size !== 1) {
         return;
@@ -947,6 +1010,8 @@ export const getEstimatorBookImportConfig = (storedBook, options = {}) => {
     itemCount,
     sources: allSources,
     fieldOptions: {
+      manufacturer: textSources,
+      website: textSources,
       productName: textSources,
       productNumber: textSources,
       description: textSources,
@@ -955,6 +1020,8 @@ export const getEstimatorBookImportConfig = (storedBook, options = {}) => {
       discount: percentSources,
     },
     defaultMapping: {
+      manufacturer: ESTIMATOR_IMPORT_IGNORE_SOURCE_ID,
+      website: ESTIMATOR_IMPORT_IGNORE_SOURCE_ID,
       productName: pickEstimatorImportDefaultSourceId(textSources, [
         "field:itemName",
         "field:description",
@@ -1016,14 +1083,31 @@ export const summarizeEstimatorBookForPart1Import = (storedBook, options = {}) =
 };
 
 const resolveEstimatorImportMapping = (config, mapping = null) => {
-  const fieldKeys = ["productName", "productNumber", "description", "units", "msrp", "discount"];
+  const fieldKeys = [
+    "manufacturer",
+    "website",
+    "productName",
+    "productNumber",
+    "description",
+    "units",
+    "msrp",
+    "discount",
+  ];
   const resolvedMapping = {};
 
   fieldKeys.forEach((fieldKey) => {
     const validOptionIds = new Set(config.fieldOptions[fieldKey].map((option) => option.id));
     const mappedValue = mapping?.[fieldKey];
+    const isFixedValueSource =
+      fieldKey === "manufacturer" || fieldKey === "website"
+        ? mappedValue === getEstimatorImportFixedSourceId(fieldKey)
+        : false;
 
-    if (mappedValue === ESTIMATOR_IMPORT_IGNORE_SOURCE_ID || validOptionIds.has(mappedValue)) {
+    if (
+      mappedValue === ESTIMATOR_IMPORT_IGNORE_SOURCE_ID ||
+      validOptionIds.has(mappedValue) ||
+      isFixedValueSource
+    ) {
       resolvedMapping[fieldKey] = mappedValue;
       return;
     }
@@ -1060,9 +1144,18 @@ const getEstimatorMappedPercentValue = (payload, sourceId) => {
   return Number.isFinite(value) ? toContractPercentValue(value) : 0;
 };
 
-export const buildPart1RowsFromEstimatorBook = (storedBook, vendorName = "", options = {}) => {
+const estimatorImportSourceHasValue = (payload, sourceId, kind) => {
+  if (!sourceId || sourceId === ESTIMATOR_IMPORT_IGNORE_SOURCE_ID) {
+    return false;
+  }
+
+  return hasEstimatorImportValue(payload.sourceValues[sourceId], kind);
+};
+
+export const buildPart1RowsFromEstimatorBook = (storedBook, manufacturerName = "", options = {}) => {
   const book = normalizeStoredBook(storedBook);
-  const manufacturer = normalizeTextValue(vendorName).trim();
+  const fixedManufacturer = normalizeTextValue(options?.manufacturer ?? manufacturerName).trim();
+  const fixedWebsite = normalizeTextValue(options?.website).trim();
   const importConfig = getEstimatorBookImportConfig(book, {
     groupIds: options?.groupIds,
     pricingMode: options?.pricingMode,
@@ -1077,25 +1170,32 @@ export const buildPart1RowsFromEstimatorBook = (storedBook, vendorName = "", opt
         return;
       }
 
-      const pricingStatusLabel = PRICING_STATUS_LABELS[item.pricingStatus] || "Priced";
       const payload = createEstimatorItemImportPayload(group, item);
+      const manufacturer =
+        resolvedMapping.manufacturer === getEstimatorImportFixedSourceId("manufacturer")
+          ? fixedManufacturer
+          : getEstimatorMappedTextValue(payload, resolvedMapping.manufacturer);
+      const website =
+        resolvedMapping.website === getEstimatorImportFixedSourceId("website")
+          ? fixedWebsite
+          : getEstimatorMappedTextValue(payload, resolvedMapping.website);
       const productName = getEstimatorMappedTextValue(payload, resolvedMapping.productName);
       const productNumber = getEstimatorMappedTextValue(payload, resolvedMapping.productNumber);
       const description = getEstimatorMappedTextValue(payload, resolvedMapping.description);
       const units = getEstimatorMappedTextValue(payload, resolvedMapping.units);
-      const msrpValue =
-        item.pricingStatus === "priced"
-          ? getEstimatorMappedMoneyValue(payload, resolvedMapping.msrp)
-          : pricingStatusLabel;
-      const discountValue =
-        item.pricingStatus === "priced"
-          ? getEstimatorMappedPercentValue(payload, resolvedMapping.discount)
-          : 0;
+      const mappedMsrpValue = getEstimatorMappedMoneyValue(payload, resolvedMapping.msrp);
+      const mappedDiscountValue = getEstimatorMappedPercentValue(payload, resolvedMapping.discount);
+      const msrpValue = estimatorImportSourceHasValue(payload, resolvedMapping.msrp, "money")
+        ? mappedMsrpValue
+        : "";
+      const discountValue = estimatorImportSourceHasValue(payload, resolvedMapping.discount, "percent")
+        ? mappedDiscountValue
+        : 0;
 
       rows.push({
         id: generateId(),
         manufacturer: manufacturer || "",
-        website: "",
+        website: website || "",
         productName,
         productNumber,
         description,
@@ -3415,7 +3515,7 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
   const [showSaveTemplateModal, setShowSaveTemplateModal] = useState(false);
 
   const createEmptyMapping = () => ({
-    type: "ignore",
+    ...createEstimatorImportMappingState(),
     customName: "",
     defaultName: "",
     targets: [],
@@ -3448,7 +3548,7 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
 
   const refreshAutoMappingNames = (sourceMappings, nextHeaderRows, rows = parsedData) =>
     sourceMappings.map((map, index) => {
-      if (!map || map.isFixed || !map.type.startsWith("other_") || map.customName) {
+      if (!map || map.isFixed || !estimatorImportMappingUsesCustomType(map) || map.customName) {
         return map;
       }
 
@@ -3505,11 +3605,16 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
   const getResolvedMappingName = (map, colIndex) =>
     map.customName || map.defaultName || getCombinedHeader(colIndex);
 
-  const handleMappingTypeChange = (index, nextType) => {
+  const toggleMappingType = (index, nextType) => {
     setMappings((currentMappings) => {
       const nextMappings = [...currentMappings];
       const currentMapping = nextMappings[index];
-      const nextDefaultName = nextType.startsWith("other_")
+      const currentTypes = normalizeEstimatorImportMappingTypes(currentMapping);
+      const nextTypes = currentTypes.includes(nextType)
+        ? currentTypes.filter((type) => type !== nextType)
+        : [...currentTypes, nextType];
+      const nextTypeState = createEstimatorImportMappingState(nextTypes);
+      const nextDefaultName = estimatorImportMappingUsesCustomType(nextTypeState)
         ? currentMapping.defaultName ||
           currentMapping.customName ||
           getCombinedHeader(index)
@@ -3517,9 +3622,11 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
 
       nextMappings[index] = {
         ...currentMapping,
-        type: nextType,
+        ...nextTypeState,
         defaultName: nextDefaultName,
-        targets: nextType === "other_discount" ? currentMapping.targets : [],
+        targets: estimatorImportMappingHasType(nextTypeState, "other_discount")
+          ? currentMapping.targets
+          : [],
       };
       return nextMappings;
     });
@@ -3527,7 +3634,7 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
 
   const createTemplateMappings = () =>
     mappings.map((map, index) => ({
-      type: map.type,
+      ...createEstimatorImportMappingState(map),
       isFixed: map.isFixed === true,
       fixedValue: map.fixedValue || "",
       defaultActive: map.defaultActive !== false,
@@ -3552,15 +3659,15 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
 
     template.mappings.forEach((templateMap, index) => {
       const isFixed = templateMap.isFixed === true;
-      const type = typeof templateMap.type === "string" ? templateMap.type : "ignore";
+      const typeState = createEstimatorImportMappingState(templateMap);
       const customName = typeof templateMap.customName === "string" ? templateMap.customName : "";
 
       nextMappings[index] = {
         ...createEmptyMapping(),
-        type,
+        ...typeState,
         customName,
         defaultName:
-          isFixed || !type.startsWith("other_")
+          isFixed || !estimatorImportMappingUsesCustomType(typeState)
             ? isFixed
               ? customName || `Fixed Col ${index + 1}`
               : ""
@@ -3685,7 +3792,7 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
 
   const skippedNoteRows = analyzedImportRows.filter((row) => row.kind === "note");
   const importableRows = analyzedImportRows.filter((row) => row.kind === "item");
-  const hasMappedColumns = mappings.some((mapping) => mapping.type !== "ignore");
+  const hasMappedColumns = mappings.some((mapping) => !estimatorImportMappingIsIgnored(mapping));
 
   const handleImport = () => {
     const newItems = [];
@@ -3701,41 +3808,44 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
       const rowAmountIds = {};
 
       mappings.forEach((map, colIdx) => {
-        if (!map || map.type === "ignore") return;
+        const selectedTypes = normalizeEstimatorImportMappingTypes(map);
+        if (!map || selectedTypes.length === 0) return;
 
         const cellValue = map.isFixed ? map.fixedValue : row[colIdx];
         const value = cellValue ? cellValue.trim() : "";
 
-        if (["itemNumber", "itemName", "description", "uom"].includes(map.type)) {
-          newItem[map.type] = value;
-        } else if (["material", "labor", "equipment"].includes(map.type)) {
-          newItem[map.type] = parseImportNumber(value);
-        } else if (map.type === "total") {
-          const parsedValue = parseFloat(parseImportNumber(value));
-          if (!Number.isNaN(parsedValue)) importedTotalValue = parsedValue;
-        } else if (map.type === "other_amount" && value) {
-          const amountId = generateId();
-          rowAmountIds[colIdx] = amountId;
-          newItem.others.push({
-            id: amountId,
-            type: "amount",
-            name: getResolvedMappingName(map, colIdx),
-            value: parseImportNumber(value),
-            isActive: map.defaultActive !== false,
-          });
-        } else if (map.type === "other_info" && value) {
-          newItem.others.push({
-            id: generateId(),
-            type: "info",
-            name: getResolvedMappingName(map, colIdx),
-            value,
-            isActive: map.defaultActive !== false,
-          });
-        }
+        selectedTypes.forEach((selectedType) => {
+          if (["itemNumber", "itemName", "description", "uom"].includes(selectedType)) {
+            newItem[selectedType] = value;
+          } else if (["material", "labor", "equipment"].includes(selectedType)) {
+            newItem[selectedType] = parseImportNumber(value);
+          } else if (selectedType === "total") {
+            const parsedValue = parseFloat(parseImportNumber(value));
+            if (!Number.isNaN(parsedValue)) importedTotalValue = parsedValue;
+          } else if (selectedType === "other_amount" && value) {
+            const amountId = generateId();
+            rowAmountIds[colIdx] = amountId;
+            newItem.others.push({
+              id: amountId,
+              type: "amount",
+              name: getResolvedMappingName(map, colIdx),
+              value: parseImportNumber(value),
+              isActive: map.defaultActive !== false,
+            });
+          } else if (selectedType === "other_info" && value) {
+            newItem.others.push({
+              id: generateId(),
+              type: "info",
+              name: getResolvedMappingName(map, colIdx),
+              value,
+              isActive: map.defaultActive !== false,
+            });
+          }
+        });
       });
 
       mappings.forEach((map, colIdx) => {
-        if (map.type !== "other_discount") return;
+        if (!estimatorImportMappingHasType(map, "other_discount")) return;
 
         const cellValue = map.isFixed ? map.fixedValue : row[colIdx];
         const value = cellValue ? cellValue.trim() : "";
@@ -3974,30 +4084,95 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
                             className="w-auto max-w-0 border-r border-slate-200 p-3 align-top font-normal last:border-r-0"
                           >
                             <div className="flex min-w-0 w-full flex-col gap-2">
-                              <select
-                                value={map.type}
-                                onChange={(event) => handleMappingTypeChange(index, event.target.value)}
-                                className={`w-full min-w-0 rounded-lg border px-2 py-1.5 text-xs transition-colors focus:outline-none focus:ring-1 focus:ring-emerald-500 ${
-                                  map.type !== "ignore"
-                                    ? "border-emerald-400 bg-emerald-50 font-medium text-emerald-900"
-                                    : "border-slate-300 bg-white text-slate-700"
+                              <div
+                                className={`rounded-lg border p-2 ${
+                                  estimatorImportMappingIsIgnored(map)
+                                    ? "border-slate-300 bg-white"
+                                    : "border-emerald-400 bg-emerald-50/60"
                                 }`}
                               >
-                                <option value="ignore">-- Ignore Column --</option>
-                                <option value="itemNumber">Item #</option>
-                                <option value="itemName">Item Name</option>
-                                <option value="description">Description</option>
-                                <option value="uom">UOM</option>
-                                <option value="material">Material Cost</option>
-                                <option value="labor">Labor Cost</option>
-                                <option value="equipment">Equipment Cost</option>
-                                <option value="total">Final Total</option>
-                                <option value="other_amount">+ Create Amount...</option>
-                                <option value="other_discount">+ Create Discount %...</option>
-                                <option value="other_info">+ Create Info...</option>
-                              </select>
+                                <div className="mb-2 flex items-center justify-between gap-2">
+                                  <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                    Map To
+                                  </span>
+                                  <span
+                                    className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                                      estimatorImportMappingIsIgnored(map)
+                                        ? "bg-slate-100 text-slate-500"
+                                        : "bg-emerald-100 text-emerald-800"
+                                    }`}
+                                  >
+                                    {estimatorImportMappingIsIgnored(map)
+                                      ? "Ignored"
+                                      : `${normalizeEstimatorImportMappingTypes(map).length} field${
+                                          normalizeEstimatorImportMappingTypes(map).length === 1
+                                            ? ""
+                                            : "s"
+                                        }`}
+                                  </span>
+                                </div>
 
-                              {map.type.startsWith("other_") && (
+                                <div className="grid grid-cols-2 gap-1.5">
+                                  {ESTIMATOR_IMPORT_STANDARD_MAPPING_OPTIONS.map((option) => {
+                                    const isChecked = estimatorImportMappingHasType(map, option.id);
+
+                                    return (
+                                      <label
+                                        key={option.id}
+                                        className={`flex cursor-pointer items-center gap-1.5 rounded-md border px-2 py-1 ${
+                                          isChecked
+                                            ? "border-emerald-300 bg-white text-emerald-900"
+                                            : "border-slate-200 bg-white/80 text-slate-600 hover:border-slate-300"
+                                        }`}
+                                      >
+                                        <input
+                                          type="checkbox"
+                                          checked={isChecked}
+                                          onChange={() => toggleMappingType(index, option.id)}
+                                          className="rounded border-emerald-300 text-emerald-600 focus:ring-emerald-500"
+                                        />
+                                        <span className="min-w-0 break-words text-[11px] leading-4">
+                                          {option.label}
+                                        </span>
+                                      </label>
+                                    );
+                                  })}
+                                </div>
+
+                                <div className="mt-2 border-t border-slate-200 pt-2">
+                                  <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                    Custom Fields
+                                  </div>
+                                  <div className="space-y-1.5">
+                                    {ESTIMATOR_IMPORT_CUSTOM_MAPPING_OPTIONS.map((option) => {
+                                      const isChecked = estimatorImportMappingHasType(map, option.id);
+
+                                      return (
+                                        <label
+                                          key={option.id}
+                                          className={`flex cursor-pointer items-center gap-1.5 rounded-md border px-2 py-1 ${
+                                            isChecked
+                                              ? "border-emerald-300 bg-white text-emerald-900"
+                                              : "border-slate-200 bg-white/80 text-slate-600 hover:border-slate-300"
+                                          }`}
+                                        >
+                                          <input
+                                            type="checkbox"
+                                            checked={isChecked}
+                                            onChange={() => toggleMappingType(index, option.id)}
+                                            className="rounded border-emerald-300 text-emerald-600 focus:ring-emerald-500"
+                                          />
+                                          <span className="min-w-0 break-words text-[11px] leading-4">
+                                            {option.label}
+                                          </span>
+                                        </label>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              </div>
+
+                              {estimatorImportMappingUsesCustomType(map) && (
                                 <div className="flex min-w-0 items-center gap-2">
                                   <input
                                     type="text"
@@ -4031,7 +4206,7 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
                                 </div>
                               )}
 
-                              {map.type === "other_discount" && (
+                              {estimatorImportMappingHasType(map, "other_discount") && (
                                 <div className="rounded border border-emerald-200 bg-emerald-50 p-2 text-xs">
                                   <div className="mb-1.5 flex items-center justify-between">
                                     <div className="font-semibold text-emerald-800">Applies To:</div>
@@ -4043,7 +4218,9 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
                                           "equipment",
                                           ...mappings
                                             .map((mapping, mappingIndex) =>
-                                              mapping.type === "other_amount" ? mappingIndex : null,
+                                              estimatorImportMappingHasType(mapping, "other_amount")
+                                                ? mappingIndex
+                                                : null,
                                             )
                                             .filter((mappingIndex) => mappingIndex !== null),
                                         ];
@@ -4055,7 +4232,10 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
                                     >
                                       {map.targets?.length > 0 &&
                                       map.targets?.length ===
-                                        3 + mappings.filter((mapping) => mapping.type === "other_amount").length
+                                        3 +
+                                          mappings.filter((mapping) =>
+                                            estimatorImportMappingHasType(mapping, "other_amount"),
+                                          ).length
                                         ? "Deselect All"
                                         : "Select All"}
                                     </button>
@@ -4073,7 +4253,7 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
                                       </label>
                                     ))}
                                     {mappings.map((mapping, mappingIndex) =>
-                                      mapping.type === "other_amount" ? (
+                                      estimatorImportMappingHasType(mapping, "other_amount") ? (
                                         <label
                                           key={mappingIndex}
                                           className="flex cursor-pointer items-center gap-1.5"
@@ -4094,7 +4274,7 @@ function ImportModal({ group, onClose, onImport, existingItemCount }) {
                                 </div>
                               )}
 
-                              {map.isFixed && map.type !== "ignore" && (
+                              {map.isFixed && !estimatorImportMappingIsIgnored(map) && (
                                 <input
                                   type="text"
                                   value={map.fixedValue}
